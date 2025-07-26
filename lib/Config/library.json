@@ -1,0 +1,19 @@
+{
+  "name": "Config",
+  "version": "1.0.0",
+  "description": "Device configuration library for ESP32 Photo Frame",
+  "keywords": "esp32, config, device",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino", "picosdk"],
+  "platforms": ["raspberrypi"]
+}

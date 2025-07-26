@@ -1,0 +1,23 @@
+{
+  "name": "GUI",
+  "version": "1.0.0",
+  "description": "GUI library for painting and BMP file handling",
+  "keywords": "gui, paint, bmp, graphics",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["raspberrypi"],
+  "dependencies": {
+    "Config": "*",
+    "Fonts": "*"
+  }
+}

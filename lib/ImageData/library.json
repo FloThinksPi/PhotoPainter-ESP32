@@ -1,0 +1,19 @@
+{
+  "name": "ImageData",
+  "version": "1.0.0",
+  "description": "Image data for ESP32 Photo Frame project",
+  "keywords": "esp32, image, display",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32", "raspberrypi"]
+}

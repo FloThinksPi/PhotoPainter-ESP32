@@ -1,0 +1,25 @@
+{
+  "name": "Examples",
+  "version": "1.0.0",
+  "description": "Example code and test functions for EPD display",
+  "keywords": "examples, test, epd, demo",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["raspberrypi"],
+  "dependencies": {
+    "Config": "*",
+    "EPaper": "*",
+    "GUI": "*",
+    "ImageData": "*"
+  }
+}

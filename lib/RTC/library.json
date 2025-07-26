@@ -1,0 +1,19 @@
+{
+  "name": "RTC",
+  "version": "1.0.0",
+  "description": "Real Time Clock library using PCF85063",
+  "keywords": "rtc, time, pcf85063, clock",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["raspberrypi"]
+}

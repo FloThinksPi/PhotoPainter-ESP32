@@ -1,0 +1,22 @@
+{
+  "name": "EPaper",
+  "version": "1.0.0",
+  "description": "E-Paper display driver for 7.3inch display",
+  "keywords": "epaper, display, waveshare, 7.3inch",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "Waveshare",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["raspberrypi"],
+  "dependencies": {
+    "Config": "*"
+  }
+}
