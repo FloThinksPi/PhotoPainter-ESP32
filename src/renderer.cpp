@@ -20,6 +20,7 @@
 #define CMD_WRITE_CHUNK       0x01
 #define CMD_RENDER_IMAGE      0x02
 #define CMD_GET_STATUS        0x03
+#define CMD_WRITE_CHUNK_ADDR  0x04  // Write chunk to specific address offset
 
 // I2C Pin Configuration for Pi Pico (SLAVE)
 #define I2C_SDA_PIN 4    // Pi Pico GPIO 4 (I2C0 SDA) -> ESP32 GPIO 21 (SDA)  
@@ -71,6 +72,46 @@ void onI2CReceive(int bytes) {
                         Serial.printf("⚠ Chunk %d: expected 123 bytes, wrote %d bytes to offset %d\n", 
                                       chunk_id, bytes_written, offset);
                     } 
+                }
+                break;
+            }
+            
+            case CMD_WRITE_CHUNK_ADDR: {
+                if (bytes >= 9) { // At least 8 bytes header + some data
+                    // Read 4-byte address offset
+                    uint32_t address_offset = 0;
+                    address_offset |= ((uint32_t)Wire.read()) << 24;
+                    address_offset |= ((uint32_t)Wire.read()) << 16;
+                    address_offset |= ((uint32_t)Wire.read()) << 8;
+                    address_offset |= Wire.read();
+                    
+                    // Read 4-byte data offset within address
+                    uint32_t data_offset = 0;
+                    data_offset |= ((uint32_t)Wire.read()) << 24;
+                    data_offset |= ((uint32_t)Wire.read()) << 16;
+                    data_offset |= ((uint32_t)Wire.read()) << 8;
+                    data_offset |= Wire.read();
+                    bytes -= 8;
+                    
+                    uint32_t final_offset = address_offset + data_offset;
+                    
+                    // Read remaining data into buffer
+                    int bytes_written = 0;
+                    for (int i = 0; i < bytes && (final_offset + i) < sizeof(image_buffer); i++) {
+                        if (Wire.available()) {
+                            image_buffer[final_offset + i] = Wire.read();
+                            bytes_written++;
+                            received_bytes = max(received_bytes, final_offset + i + 1);
+                        } else {
+                            Serial.printf("⚠ Wire not available at byte %d of addressed chunk\n", i);
+                            break;
+                        }
+                    }
+                    Serial.printf("Addressed write: addr_offset=%u, data_offset=%u, final=%u, wrote=%d bytes\n", 
+                                 address_offset, data_offset, final_offset, bytes_written);
+                } else {
+                    // Flush remaining bytes for malformed command
+                    while (Wire.available()) Wire.read();
                 }
                 break;
             }

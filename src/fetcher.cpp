@@ -65,6 +65,7 @@ uint32_t totalChunks = (sizeof(Image7color) + CHUNK_SIZE - 1) / CHUNK_SIZE; // T
 
 // I2C command definitions for master->slave communication
 #define CMD_WRITE_CHUNK       0x01
+#define CMD_WRITE_CHUNK_ADDR  0x04  // Write chunk to specific address offset
 #define CMD_RENDER_IMAGE      0x02  
 #define CMD_GET_STATUS        0x03
 
@@ -200,6 +201,51 @@ bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
     return true;
   } else {
     Serial.printf("✗ Failed to send chunk %d (error: %d)\n", chunk_id, error);
+    errorCount++;
+    return false;
+  }
+}
+
+// Send a chunk of data to specific address offset in Pi Pico slave memory
+bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_t data_size) {
+  // I2C buffer limit: 128 bytes buffer - 9 bytes header = 119 bytes max data
+  if (data_size > 119) data_size = 119; // Max data size to fit in I2C transaction with address
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_WRITE_CHUNK_ADDR);
+  
+  // Send address offset (4 bytes, big endian)
+  Wire.write((address_offset >> 24) & 0xFF);
+  Wire.write((address_offset >> 16) & 0xFF); 
+  Wire.write((address_offset >> 8) & 0xFF);
+  Wire.write(address_offset & 0xFF);
+  
+  // Send data size (4 bytes, big endian)  
+  Wire.write((data_size >> 24) & 0xFF);
+  Wire.write((data_size >> 16) & 0xFF);
+  Wire.write((data_size >> 8) & 0xFF);
+  Wire.write(data_size & 0xFF);
+  
+  // Send chunk data
+  size_t written = Wire.write(data, data_size);
+  
+  // Verify all data was queued for transmission
+  if (written != data_size) {
+    Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for address 0x%08X\n", 
+                  written, data_size, address_offset);
+    Wire.endTransmission(); // Clean up
+    errorCount++;
+    return false;
+  }
+  
+  uint8_t error = Wire.endTransmission();
+  
+  if (error == 0) {
+    lastI2CActivity = millis();
+    i2cTransactionCount++;
+    return true;
+  } else {
+    Serial.printf("✗ Failed to send chunk to address 0x%08X (error: %d)\n", address_offset, error);
     errorCount++;
     return false;
   }
@@ -574,8 +620,8 @@ bool downloadAndConvertBmpImage(const char* url) {
         return false;
       }
       
-      if (infoHeader.biWidth != 800 || infoHeader.biHeight != 480) {
-        Serial.printf("✗ BMP dimensions (%dx%d) don't match display (800x480)\n", 
+      if (infoHeader.biWidth != 480 || infoHeader.biHeight != 800) {
+        Serial.printf("✗ BMP dimensions (%dx%d) don't match display (480x800)\n", 
                      infoHeader.biWidth, infoHeader.biHeight);
         Serial.println("   → Use the ImageConverter tool to create properly sized BMPs");
         http.end();
@@ -667,71 +713,72 @@ bool downloadAndConvertBmpImage(const char* url) {
       
       Serial.printf("Skipped to pixel data at offset %d\n", fileHeader.bOffset);
       
-      // Now stream and convert pixel data
-      const uint32_t epaper_size = 192000; // 800x480 pixels, 4 bits per pixel
-      const uint32_t work_buffer_size = CHUNK_SIZE * 2; // Process 2 I2C chunks at a time
+      // Now stream and convert pixel data with direct addressed writes
+      const uint32_t epaper_size = 192000; // 480x800 pixels, 4 bits per pixel
+      const uint32_t work_buffer_size = 119; // Max data per addressed I2C transaction
       uint8_t* work_buffer = (uint8_t*)malloc(work_buffer_size);
       
       if (!work_buffer) {
         Serial.printf("✗ Failed to allocate work buffer (%d bytes)\n", work_buffer_size);
+        if (palette_buffer) {
+          free(palette_buffer);
+        }
         http.end();
         return false;
       }
       
-      Serial.printf("✓ Allocated work buffer: %d bytes\n", work_buffer_size);
+      Serial.printf("✓ Allocated work buffer: %d bytes (streaming mode)\n", work_buffer_size);
       
-      uint32_t chunk_id = 0;
-      uint32_t bytes_sent = 0;
+      // Process BMP pixel data sequentially, building chunks for direct memory writes
+      uint32_t pixels_processed = 0;
+      uint32_t total_pixels = infoHeader.biWidth * infoHeader.biHeight;
       uint32_t work_buffer_pos = 0;
+      uint32_t current_byte_address = 0;
+      uint32_t expected_byte_address = 0;
       
-      // Process BMP pixel data row by row
-      // BMP stores pixels bottom-to-top, so we need to handle this
+      // Process rows in reverse order since BMP stores bottom-to-top but display expects top-to-bottom
       for (int32_t row = infoHeader.biHeight - 1; row >= 0; row--) {
         for (uint32_t col = 0; col < infoHeader.biWidth; col += 2) { // Process 2 pixels at a time
           uint8_t pixel1_color, pixel2_color;
           
-          // Process first pixel based on bit depth
+          // Read first pixel
           if (infoHeader.biBitCount == 8) {
-            // 8-bit indexed color
             if (stream->available() >= 1) {
-              uint8_t index1;
-              stream->readBytes(&index1, 1);
-              uint8_t r1, g1, b1;
-              paletteToRgb(index1, palette_buffer, &r1, &g1, &b1);
-              pixel1_color = rgbToEpaperColor(r1, g1, b1);
+              uint8_t index;
+              stream->readBytes(&index, 1);
+              uint8_t r, g, b;
+              paletteToRgb(index, palette_buffer, &r, &g, &b);
+              pixel1_color = rgbToEpaperColor(r, g, b);
             } else {
               pixel1_color = EPD_7IN3F_WHITE;
             }
           } else {
-            // 24-bit RGB color
             if (stream->available() >= 3) {
-              uint8_t rgb1[3];
-              stream->readBytes(rgb1, 3);
-              pixel1_color = rgbToEpaperColor(rgb1[2], rgb1[1], rgb1[0]); // Convert BGR to RGB
+              uint8_t rgb[3];
+              stream->readBytes(rgb, 3);
+              pixel1_color = rgbToEpaperColor(rgb[2], rgb[1], rgb[0]);
             } else {
               pixel1_color = EPD_7IN3F_WHITE;
             }
           }
           
-          // Process second pixel based on bit depth (if available)
+          // Read second pixel if available
           if (col + 1 < infoHeader.biWidth) {
             if (infoHeader.biBitCount == 8) {
-              // 8-bit indexed color
               if (stream->available() >= 1) {
-                uint8_t index2;
-                stream->readBytes(&index2, 1);
-                uint8_t r2, g2, b2;
-                paletteToRgb(index2, palette_buffer, &r2, &g2, &b2);
-                pixel2_color = rgbToEpaperColor(r2, g2, b2);
+                uint8_t index;
+                stream->readBytes(&index, 1);
+                uint8_t r, g, b;
+                paletteToRgb(index, palette_buffer, &r, &g, &b);
+                pixel2_color = rgbToEpaperColor(r, g, b);
               } else {
                 pixel2_color = EPD_7IN3F_WHITE;
               }
             } else {
-              // 24-bit RGB color
               if (stream->available() >= 3) {
-                uint8_t rgb2[3];
-                stream->readBytes(rgb2, 3);
-                pixel2_color = rgbToEpaperColor(rgb2[2], rgb2[1], rgb2[0]); // Convert BGR to RGB
+                uint8_t rgb[3];
+                stream->readBytes(rgb, 3);
+                pixel2_color = rgbToEpaperColor(rgb[2], rgb[1], rgb[0]);
               } else {
                 pixel2_color = EPD_7IN3F_WHITE;
               }
@@ -740,37 +787,58 @@ bool downloadAndConvertBmpImage(const char* url) {
             pixel2_color = EPD_7IN3F_WHITE;
           }
           
+          // Calculate destination byte address in renderer memory
+          // BMP row 'row' (bottom-to-top) maps to display row (height-1-row) (top-to-bottom)
+          // For 480x800 display: width=480, height=800
+          uint32_t display_row = (infoHeader.biHeight - 1) - row; // Convert BMP bottom-to-top to display top-to-bottom
+          uint32_t display_col = col;
+          uint32_t pixel_index = display_row * 480 + display_col; // Use actual display width (480)
+          uint32_t byte_address = pixel_index / 2;
+          
           // Pack two 4-bit pixels into one byte
           uint8_t packed_byte = (pixel1_color << 4) | pixel2_color;
-          work_buffer[work_buffer_pos++] = packed_byte;
           
-          // Send chunk when buffer is full
-          if (work_buffer_pos >= work_buffer_size) {
-            // Send in CHUNK_SIZE pieces
-            for (uint32_t offset = 0; offset < work_buffer_pos; offset += CHUNK_SIZE) {
-              uint32_t send_size = min((uint32_t)CHUNK_SIZE, work_buffer_pos - offset);
-              
-              if (!sendImageChunk(chunk_id, &work_buffer[offset], send_size)) {
-                Serial.printf("✗ Failed to send BMP chunk %d\n", chunk_id);
-                free(work_buffer);
-                http.end();
-                return false;
+          // Check if we need to send current buffer (non-contiguous address or buffer full)
+          if (work_buffer_pos > 0 && (byte_address != expected_byte_address || work_buffer_pos >= work_buffer_size)) {
+            // Send current buffer
+            if (!sendImageChunkToAddress(current_byte_address, work_buffer, work_buffer_pos)) {
+              Serial.printf("✗ Failed to send BMP chunk to address 0x%08X\n", current_byte_address);
+              free(work_buffer);
+              if (palette_buffer) {
+                free(palette_buffer);
               }
-              
-              chunk_id++;
-              bytes_sent += send_size;
-              
-              // Progress reporting
-              if (bytes_sent % 5000 == 0) {
-                float percent = ((float)bytes_sent / epaper_size) * 100.0;
-                Serial.printf("BMP converted: %d/%d bytes (%.1f%%)\n", 
-                             bytes_sent, epaper_size, percent);
-              }
-              
-              delay(2); // I2C stability
+              http.end();
+              return false;
             }
             
-            work_buffer_pos = 0; // Reset buffer
+            // Progress reporting
+            if ((current_byte_address + work_buffer_pos) % 5000 == 0) {
+              float percent = ((float)(current_byte_address + work_buffer_pos) / epaper_size) * 100.0;
+              Serial.printf("BMP streaming: %d/%d bytes (%.1f%%)\n", 
+                           current_byte_address + work_buffer_pos, epaper_size, percent);
+            }
+            
+            // Reset buffer for next chunk
+            work_buffer_pos = 0;
+            delay(2); // I2C stability
+          }
+          
+          // Start new buffer if empty
+          if (work_buffer_pos == 0) {
+            current_byte_address = byte_address;
+          }
+          
+          // Add byte to buffer
+          work_buffer[work_buffer_pos++] = packed_byte;
+          expected_byte_address = byte_address + 1;
+          
+          pixels_processed += 2; // Processed 2 pixels
+          
+          // Progress reporting for pixel processing
+          if (pixels_processed % 20000 == 0) {
+            float percent = ((float)pixels_processed / total_pixels) * 100.0;
+            Serial.printf("BMP processing: %d/%d pixels (%.1f%%)\n", 
+                         pixels_processed, total_pixels, percent);
           }
         }
         
@@ -786,43 +854,20 @@ bool downloadAndConvertBmpImage(const char* url) {
         }
       }
       
-      // Send any remaining data in buffer
+      // Send any remaining data in work buffer
       if (work_buffer_pos > 0) {
-        for (uint32_t offset = 0; offset < work_buffer_pos; offset += CHUNK_SIZE) {
-          uint32_t send_size = min((uint32_t)CHUNK_SIZE, work_buffer_pos - offset);
-          
-          if (!sendImageChunk(chunk_id, &work_buffer[offset], send_size)) {
-            Serial.printf("✗ Failed to send final BMP chunk %d\n", chunk_id);
-            free(work_buffer);
-            http.end();
-            return false;
-          }
-          
-          chunk_id++;
-          bytes_sent += send_size;
-          delay(2);
-        }
-      }
-      
-      // Pad to exactly 192,000 bytes if needed
-      while (bytes_sent < epaper_size) {
-        uint32_t remaining = epaper_size - bytes_sent;
-        uint32_t pad_size = min((uint32_t)CHUNK_SIZE, remaining);
-        
-        // Fill with white pixels
-        memset(work_buffer, 0x11, pad_size); // 0x11 = two white pixels per byte
-        
-        if (!sendImageChunk(chunk_id, work_buffer, pad_size)) {
-          Serial.printf("✗ Failed to send padding chunk %d\n", chunk_id);
+        if (!sendImageChunkToAddress(current_byte_address, work_buffer, work_buffer_pos)) {
+          Serial.printf("✗ Failed to send final BMP chunk to address 0x%08X\n", current_byte_address);
           free(work_buffer);
+          if (palette_buffer) {
+            free(palette_buffer);
+          }
           http.end();
           return false;
         }
-        
-        chunk_id++;
-        bytes_sent += pad_size;
-        delay(2);
       }
+      
+      Serial.printf("✓ BMP streaming completed: %d pixels processed\n", pixels_processed);
       
       free(work_buffer);
       if (palette_buffer) {
@@ -830,7 +875,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       }
       http.end();
       
-      Serial.printf("✓ BMP conversion completed: %d bytes in %d chunks\n", bytes_sent, chunk_id);
+      Serial.printf("✓ BMP streaming conversion completed: %d pixels processed\n", pixels_processed);
       
       // Send render command
       if (!sendRenderCommand()) {
@@ -889,7 +934,7 @@ void loop() {
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
     if (status == STATUS_READY || status == STATUS_ERROR) {
-      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella_indexed.bmp";
+      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella_indexed_480x800.bmp";
       
       Serial.printf("Converting and streaming BMP from: %s\n", imageUrl);
       if (downloadAndConvertBmpImage(imageUrl)) {
