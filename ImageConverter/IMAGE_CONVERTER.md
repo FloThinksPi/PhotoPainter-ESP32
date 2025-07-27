@@ -7,7 +7,8 @@ This tool converts images to the optimal format for your ESP32 e-paper photo fra
 - **Multi-format support**: JPEG, PNG, BMP, TIFF, WEBP, HEIF/HEIC (iPhone photos), AVIF (modern web images)
 - **Apple photo support**: Native HEIF/HEIC format from modern iPhones and iPads
 - **Modern web format support**: AVIF format with superior compression and quality
-- **Automatic sizing**: Converts to 800×480 for landscape or 480×800 for portrait
+- **Automatic sizing**: Converts all images to 800×480 (landscape) for ESP32 display
+- **Smart rotation**: Portrait images are automatically rotated to landscape orientation
 - **7-color palette**: Optimized for e-paper displays (Black, White, Red, Green, Blue, Yellow, Orange)
 - **Smart resizing**: Scale (fit with padding), crop (fill and trim), or stretch modes
 - **Dithering**: Floyd-Steinberg dithering for better color reproduction
@@ -16,24 +17,24 @@ This tool converts images to the optimal format for your ESP32 e-paper photo fra
 ## Quick Start
 
 ```bash
-# Basic conversion (auto-detects orientation)
+# Basic conversion (automatically rotates portraits to landscape)
 python dither.py photo.jpg
 
-# iPhone HEIC photo with landscape cropping
-python dither.py IMG_1234.HEIC --orientation landscape --mode crop
+# iPhone HEIC photo with cropping (auto-rotated to 800x480)
+python dither.py IMG_1234.HEIC --mode crop
 
-# Modern AVIF web image
-python dither.py modern_image.avif --orientation landscape --mode crop
+# Modern AVIF web image (auto-rotated to landscape)
+python dither.py modern_image.avif --mode crop
 
-# Portrait with no dithering
-python dither.py image.jpeg --orientation portrait --dither none
+# Portrait image (automatically rotated to landscape)
+python dither.py portrait.jpeg --dither none
 ```
 
 ## Command Line Options
 
 | Option | Values | Description |
 |--------|--------|-------------|
-| `--orientation` | `landscape`, `portrait`, `auto` | Target orientation (default: auto) |
+| `--orientation` | `landscape`, `portrait`, `auto` | Target orientation (note: output is always 800×480, portraits auto-rotated) |
 | `--mode` | `scale`, `crop`, `stretch` | Resize method (default: scale) |
 | `--dither` | `floyd`, `none` | Dithering algorithm (default: floyd) |
 | `--format` | `indexed`, `rgb` | Output format: indexed (8-bit, smaller) or rgb (24-bit, compatible) |
@@ -78,6 +79,17 @@ Use the included `convert-image.bat` for easier Windows usage:
 convert-image.bat photo.jpg
 convert-image.bat IMG_1234.HEIC --mode crop --preview
 ```
+
+## Automatic Portrait Rotation
+
+The converter automatically handles portrait images for optimal display:
+
+- **Portrait detection**: Images where height > width are automatically detected
+- **Smart rotation**: Portrait images are rotated 90° clockwise to become landscape
+- **Consistent output**: All images are converted to 800×480 (landscape) format
+- **No manual intervention**: Works automatically regardless of input orientation
+
+This ensures all images fit the ESP32 e-paper display perfectly without manual rotation.
 
 ## Output
 

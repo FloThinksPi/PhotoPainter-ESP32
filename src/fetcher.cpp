@@ -498,6 +498,9 @@ bool downloadAndConvertBmpImage(const char* url) {
       // Check available heap before proceeding
       Serial.printf("Free heap before conversion: %d bytes\n", ESP.getFreeHeap());
       
+      // Small delay to ensure stream is properly established
+      delay(100);
+      
       WiFiClient* stream = http.getStreamPtr();
       
       // Read BMP headers first
@@ -510,19 +513,38 @@ bool downloadAndConvertBmpImage(const char* url) {
         return false;
       }
       
-      // Read headers
+      // Read headers with proper buffering and timeout
       size_t header_read = 0;
-      while (header_read < header_size && stream->available()) {
-        size_t read_size = stream->readBytes(&header_buffer[header_read], header_size - header_read);
-        header_read += read_size;
+      unsigned long start_time = millis();
+      const unsigned long timeout = 10000; // 10 second timeout
+      
+      Serial.printf("Reading BMP headers (%d bytes)...\n", header_size);
+      
+      while (header_read < header_size && (millis() - start_time) < timeout) {
+        if (stream->available() > 0) {
+          size_t available = stream->available();
+          size_t to_read = min(available, header_size - header_read);
+          size_t read_size = stream->readBytes(&header_buffer[header_read], to_read);
+          
+          if (read_size > 0) {
+            header_read += read_size;
+            Serial.printf("Read %d bytes, total: %d/%d\n", read_size, header_read, header_size);
+          }
+        } else {
+          delay(10); // Wait for more data
+        }
       }
       
       if (header_read < header_size) {
-        Serial.printf("✗ Failed to read BMP headers (got %d of %d bytes)\n", header_read, header_size);
+        Serial.printf("✗ Failed to read BMP headers (got %d of %d bytes after %lu ms)\n", 
+                     header_read, header_size, millis() - start_time);
+        Serial.printf("Stream available: %d bytes\n", stream->available());
         free(header_buffer);
         http.end();
         return false;
       }
+      
+      Serial.printf("✓ Successfully read BMP headers (%d bytes)\n", header_read);
       
       // Parse BMP headers
       BMPFILEHEADER fileHeader;
@@ -540,6 +562,10 @@ bool downloadAndConvertBmpImage(const char* url) {
       Serial.printf("BMP dimensions: %dx%d pixels\n", infoHeader.biWidth, infoHeader.biHeight);
       Serial.printf("Bit depth: %d bits per pixel\n", infoHeader.biBitCount);
       Serial.printf("Data offset: %d bytes\n", fileHeader.bOffset);
+      Serial.printf("Compression: %d\n", infoHeader.biCompression);
+      Serial.printf("Image size: %d bytes\n", infoHeader.bimpImageSize);
+      Serial.printf("Colors used: %d\n", infoHeader.biClrUsed);
+      Serial.printf("Important colors: %d\n", infoHeader.biClrImportant);
       
       // Validate format - support both 8-bit indexed and 24-bit RGB
       if (infoHeader.biBitCount != 8 && infoHeader.biBitCount != 24) {
@@ -549,8 +575,11 @@ bool downloadAndConvertBmpImage(const char* url) {
       }
       
       if (infoHeader.biWidth != 800 || infoHeader.biHeight != 480) {
-        Serial.printf("⚠ BMP dimensions (%dx%d) don't match display (800x480)\n", 
+        Serial.printf("✗ BMP dimensions (%dx%d) don't match display (800x480)\n", 
                      infoHeader.biWidth, infoHeader.biHeight);
+        Serial.println("   → Use the ImageConverter tool to create properly sized BMPs");
+        http.end();
+        return false;
       }
       
       // Skip to pixel data
@@ -569,29 +598,71 @@ bool downloadAndConvertBmpImage(const char* url) {
           return false;
         }
         
-        // Read palette
+        // Read palette with proper buffering
         size_t palette_read = 0;
-        while (palette_read < palette_size && stream->available()) {
-          size_t read_size = stream->readBytes(&palette_buffer[palette_read], palette_size - palette_read);
-          palette_read += read_size;
+        start_time = millis();
+        
+        Serial.printf("Reading BMP palette (%d bytes)...\n", palette_size);
+        
+        while (palette_read < palette_size && (millis() - start_time) < timeout) {
+          if (stream->available() > 0) {
+            size_t available = stream->available();
+            size_t to_read = min(available, palette_size - palette_read);
+            size_t read_size = stream->readBytes(&palette_buffer[palette_read], to_read);
+            
+            if (read_size > 0) {
+              palette_read += read_size;
+              if (palette_read % 256 == 0) { // Progress every 256 bytes
+                Serial.printf("Palette read: %d/%d bytes\n", palette_read, palette_size);
+              }
+            }
+          } else {
+            delay(10); // Wait for more data
+          }
         }
         
         if (palette_read < palette_size) {
-          Serial.printf("✗ Failed to read BMP palette (got %d of %d bytes)\n", palette_read, palette_size);
+          Serial.printf("✗ Failed to read BMP palette (got %d of %d bytes after %lu ms)\n", 
+                       palette_read, palette_size, millis() - start_time);
           free(palette_buffer);
           http.end();
           return false;
         }
         
+        Serial.printf("✓ Successfully read BMP palette (%d bytes)\n", palette_read);
         bytes_read_so_far += palette_size;
-        Serial.printf("✓ Read 8-bit BMP color palette (%d colors)\n", 256);
       }
       
-      // Skip any remaining bytes to reach pixel data
-      while (bytes_read_so_far < fileHeader.bOffset && stream->available()) {
-        uint8_t skip_byte;
-        stream->readBytes(&skip_byte, 1);
-        bytes_read_so_far++;
+      // Skip any remaining bytes to reach pixel data with proper buffering
+      Serial.printf("Skipping to pixel data offset %d (currently at %d)...\n", 
+                   fileHeader.bOffset, bytes_read_so_far);
+      
+      while (bytes_read_so_far < fileHeader.bOffset) {
+        if (stream->available() > 0) {
+          size_t to_skip = min((size_t)stream->available(), 
+                              (size_t)(fileHeader.bOffset - bytes_read_so_far));
+          uint8_t* skip_buffer = (uint8_t*)malloc(min(to_skip, (size_t)512)); // 512 byte chunks
+          
+          if (skip_buffer) {
+            size_t skipped = stream->readBytes(skip_buffer, min(to_skip, (size_t)512));
+            bytes_read_so_far += skipped;
+            free(skip_buffer);
+            
+            if (bytes_read_so_far % 1000 == 0) {
+              Serial.printf("Skipped to offset: %d/%d\n", bytes_read_so_far, fileHeader.bOffset);
+            }
+          } else {
+            // Fallback: skip one byte at a time
+            uint8_t skip_byte;
+            if (stream->readBytes(&skip_byte, 1) == 1) {
+              bytes_read_so_far++;
+            } else {
+              delay(1);
+            }
+          }
+        } else {
+          delay(10); // Wait for more data
+        }
       }
       
       Serial.printf("Skipped to pixel data at offset %d\n", fileHeader.bOffset);
@@ -818,7 +889,7 @@ void loop() {
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
     if (status == STATUS_READY || status == STATUS_ERROR) {
-      const char* imageUrl = "https://....";
+      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella_indexed.bmp";
       
       Serial.printf("Converting and streaming BMP from: %s\n", imageUrl);
       if (downloadAndConvertBmpImage(imageUrl)) {
