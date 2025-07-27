@@ -6,7 +6,7 @@
 #
 """
 ESP32 Photo Frame Image Converter
-Converts images (JPEG, PNG, BMP, HEIF/HEIC, etc.) to 480x800 BMP format
+Converts images (JPEG, PNG, BMP, HEIF/HEIC, etc.) to 800x480 BMP format
 with 7-color e-paper display palette and dithering.
 """
 
@@ -59,7 +59,7 @@ def create_argument_parser():
         supported_formats += ", AVIF (modern web format)"
     
     parser = argparse.ArgumentParser(
-        description='Convert images to 480x800 BMP format for ESP32 e-paper display',
+        description='Convert images to 800x480 BMP format for ESP32 e-paper display',
         epilog=f'Supported formats: {supported_formats}'
     )
     
@@ -73,7 +73,7 @@ def create_argument_parser():
         '--orientation', '--dir',
         choices=['landscape', 'portrait', 'auto'], 
         default='auto',
-        help='Target orientation (output is always 480x800 portrait)'
+        help='Target orientation (output is always 800x480 landscape)'
     )
     
     parser.add_argument(
@@ -160,10 +160,10 @@ def validate_input_file(filepath):
     return True
 
 def determine_target_size(input_size, orientation):
-    """Determine target dimensions - always outputs 480x800 (portrait) for ESP32 display."""
-    # ESP32 e-paper display is always 480x800 (portrait orientation)
+    """Determine target dimensions - always outputs 800x480 (landscape) for ESP32 display."""
+    # ESP32 e-paper display is always 800x480 (landscape orientation)
     # Images will be automatically rotated if needed to fit this format
-    return 480, 800
+    return 800, 480
 
 def get_resize_filter(quality):
     """Get PIL resize filter based on quality setting."""
@@ -281,15 +281,15 @@ def main():
             
             print_image_info(input_image, "Input image", args.verbose)
             
-            # Auto-rotate landscape images to portrait for 480x800 display
-            # If width > height, rotate 90 degrees to make height the longer dimension
-            if input_image.size[0] > input_image.size[1]:  # Landscape orientation
+            # Auto-rotate portrait images to landscape for 800x480 display
+            # If height > width, rotate 90 degrees to make width the longer dimension
+            if input_image.size[1] > input_image.size[0]:  # Portrait orientation
                 if args.verbose:
-                    print(f"🔄 Auto-rotating landscape image ({input_image.size[0]}x{input_image.size[1]} → portrait)")
+                    print(f"🔄 Auto-rotating portrait image ({input_image.size[0]}x{input_image.size[1]} → landscape)")
                 input_image = input_image.rotate(90, expand=True)  # Rotate 90° counter-clockwise
                 print_image_info(input_image, "Rotated image", args.verbose)
             
-            # Target is always 480x800 for ESP32 display
+            # Target is always 800x480 for ESP32 display
             target_size = determine_target_size(input_image.size, args.orientation)
             
             if args.verbose:

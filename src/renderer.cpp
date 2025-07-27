@@ -21,6 +21,7 @@
 #define CMD_RENDER_IMAGE      0x02
 #define CMD_GET_STATUS        0x03
 #define CMD_WRITE_CHUNK_ADDR  0x04  // Write chunk to specific address offset
+#define CMD_RENDER_BMP_ORDER  0x05  // Render image data that's in BMP order (needs reordering)
 
 // I2C Pin Configuration for Pi Pico (SLAVE)
 #define I2C_SDA_PIN 4    // Pi Pico GPIO 4 (I2C0 SDA) -> ESP32 GPIO 21 (SDA)  
@@ -32,6 +33,7 @@
 static uint8_t image_buffer[192000]; // Buffer to store received image
 static uint32_t received_bytes = 0;
 static bool render_requested = false;
+static bool bmp_reorder_needed = false; // Flag to track if BMP reordering is needed
 static uint8_t status_response = 0; // 0=ready, 1=receiving, 2=rendering, 3=error
 
 extern const char *fileList;
@@ -118,7 +120,15 @@ void onI2CReceive(int bytes) {
             
             case CMD_RENDER_IMAGE:
                 render_requested = true;
+                bmp_reorder_needed = false; // Regular render, no reordering needed
                 Serial.printf("Render command received for %d bytes\n", received_bytes);
+                break;
+                
+            case CMD_RENDER_BMP_ORDER:
+                render_requested = true;
+                bmp_reorder_needed = true; // BMP reordering is needed
+                Serial.printf("BMP reorder and render command received for %d bytes\n", received_bytes);
+                status_response = 2; // Set to rendering status
                 break;
                 
             case CMD_GET_STATUS:
@@ -185,11 +195,87 @@ uint8_t handle_i2c_get_status() {
 // Global flag to track render completion
 static bool render_was_completed = false;
 
+// Reorder BMP data from sequential (BMP order) to display order
+void reorderBmpToDisplay() {
+    Serial.println("Reordering BMP data to display format...");
+    
+    const uint32_t width = 800;
+    const uint32_t height = 480;
+    const uint32_t bytes_per_row = width / 2; // 400 bytes per row (2 pixels per byte)
+    
+    // Allocate temporary buffer for reordering
+    uint8_t* temp_buffer = (uint8_t*)malloc(192000);
+    if (!temp_buffer) {
+        Serial.println("✗ Failed to allocate temp buffer for BMP reordering");
+        return;
+    }
+    
+    Serial.println("Applying BMP to display transformations...");
+    
+    // The image_buffer currently contains BMP data in this order:
+    // - Row 0 (bottom of image) followed by Row 1, Row 2, ... Row 479 (top of image)
+    // - Each row has pixels left-to-right as they appear in BMP
+    //
+    // We need to transform to display order:
+    // - Row 0 should be top of display, Row 479 should be bottom
+    // - Apply X-coordinate flip: display_x = (width-1) - bmp_x
+    
+    for (uint32_t bmp_row = 0; bmp_row < height; bmp_row++) {
+        // Convert BMP row to display row (flip Y coordinate)
+        uint32_t display_row = (height - 1) - bmp_row;
+        
+        // Source: current row in BMP order
+        uint32_t src_row_start = bmp_row * bytes_per_row;
+        
+        // Destination: target row in display order
+        uint32_t dst_row_start = display_row * bytes_per_row;
+        
+        // Process each pair of pixels in the row (with X-flip)
+        for (uint32_t pixel_pair = 0; pixel_pair < bytes_per_row; pixel_pair++) {
+            uint32_t src_byte_pos = src_row_start + pixel_pair;
+            
+            // Extract the two pixels from source byte
+            uint8_t src_byte = image_buffer[src_byte_pos];
+            uint8_t left_pixel = (src_byte >> 4) & 0x0F;  // High nibble
+            uint8_t right_pixel = src_byte & 0x0F;        // Low nibble
+            
+            // Apply X-coordinate flip: the rightmost pixel pair becomes leftmost
+            uint32_t flipped_pixel_pair = (bytes_per_row - 1) - pixel_pair;
+            uint32_t dst_byte_pos = dst_row_start + flipped_pixel_pair;
+            
+            // Swap left and right pixels when flipping X coordinate
+            uint8_t flipped_byte = (right_pixel << 4) | left_pixel;
+            
+            temp_buffer[dst_byte_pos] = flipped_byte;
+        }
+        
+        // Progress reporting
+        if (bmp_row % 100 == 0) {
+            float percent = ((float)(bmp_row + 1) / height) * 100.0;
+            Serial.printf("Reordering progress: %d/%d rows (%.1f%%)\n", 
+                         bmp_row + 1, height, percent);
+        }
+    }
+    
+    // Copy reordered data back to image buffer
+    memcpy(image_buffer, temp_buffer, 192000);
+    free(temp_buffer);
+    
+    Serial.println("✓ BMP reordering completed - image is now in display format");
+}
+
 // Check if render is requested and process it
 bool check_and_process_render() {
     if (render_requested && received_bytes > 0) {
         Serial.printf("Processing render request for %d bytes\n", received_bytes);
         status_response = 2; // rendering
+        
+        // Apply BMP reordering if needed
+        if (bmp_reorder_needed) {
+            Serial.println("BMP reordering requested - converting from BMP order to display order");
+            reorderBmpToDisplay();
+            bmp_reorder_needed = false; // Reset flag
+        }
         
         // Expected size for e-paper display: 800x480 pixels, 4 bits per pixel = 192,000 bytes
         const uint32_t expected_size = 192000;

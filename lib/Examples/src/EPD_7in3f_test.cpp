@@ -150,29 +150,20 @@ int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float v
     }
     
     printf("✓ Using provided image buffer directly (no malloc needed)\r\n");
-    printf("Paint_NewImage\r\n");
-    Paint_NewImage(Image, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT, 0, EPD_7IN3F_WHITE);
-    Paint_SetScale(7);
-
-    printf("Using received image data directly (%d bytes)\r\n", data_size);
     
-    printf("Image data ready for display\r\n");
-
-    Paint_SetRotate(270);
-    char strvol[21] = {0};
-    sprintf(strvol, "%f V", vol);
-    if(vol < 3.3) {
-        Paint_DrawString_EN(10, 10, "Low voltage, please charge in time.", &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
-        Paint_DrawString_EN(10, 26, strvol, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
-    }
-
+    // Display the image data directly without any Paint operations that might modify it
+    printf("Displaying image data directly (%d bytes)\r\n", data_size);
+    
     printf("EPD_Display\r\n");
     EPD_7IN3F_Display(Image);
 
     printf("Goto Sleep...\r\n\r\n");
     EPD_7IN3F_Sleep();
-    // No need to free Image since we're using the provided buffer
-    Image = NULL;
+    
+    // Show voltage warning after display (optional)
+    if(vol < 3.3) {
+        printf("WARNING: Low voltage detected: %f V - please charge\r\n", vol);
+    }
 
     return 0;
 }
