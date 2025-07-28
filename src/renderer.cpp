@@ -87,15 +87,16 @@ void onI2CReceive(int bytes) {
                     address_offset |= ((uint32_t)Wire.read()) << 8;
                     address_offset |= Wire.read();
                     
-                    // Read 4-byte data offset within address
-                    uint32_t data_offset = 0;
-                    data_offset |= ((uint32_t)Wire.read()) << 24;
-                    data_offset |= ((uint32_t)Wire.read()) << 16;
-                    data_offset |= ((uint32_t)Wire.read()) << 8;
-                    data_offset |= Wire.read();
+                    // Read 4-byte data size (NOT data offset!)
+                    uint32_t data_size = 0;
+                    data_size |= ((uint32_t)Wire.read()) << 24;
+                    data_size |= ((uint32_t)Wire.read()) << 16;
+                    data_size |= ((uint32_t)Wire.read()) << 8;
+                    data_size |= Wire.read();
                     bytes -= 8;
                     
-                    uint32_t final_offset = address_offset + data_offset;
+                    // Final offset is just the address_offset (no addition!)
+                    uint32_t final_offset = address_offset;
                     
                     // Read remaining data into buffer
                     int bytes_written = 0;
@@ -109,8 +110,8 @@ void onI2CReceive(int bytes) {
                             break;
                         }
                     }
-                    Serial.printf("Addressed write: addr_offset=%u, data_offset=%u, final=%u, wrote=%d bytes\n", 
-                                 address_offset, data_offset, final_offset, bytes_written);
+                    Serial.printf("Addressed write: addr=%u, expected_size=%u, final=%u, wrote=%d bytes\n", 
+                                 address_offset, data_size, final_offset, bytes_written);
                 } else {
                     // Flush remaining bytes for malformed command
                     while (Wire.available()) Wire.read();
@@ -243,7 +244,8 @@ void reorderBmpToDisplay() {
             uint32_t flipped_pixel_pair = (bytes_per_row - 1) - pixel_pair;
             uint32_t dst_byte_pos = dst_row_start + flipped_pixel_pair;
             
-            // Swap left and right pixels when flipping X coordinate
+            // CRITICAL: When flipping X, we also need to swap left/right pixels within the byte
+            // This is because we're essentially mirroring the entire row
             uint8_t flipped_byte = (right_pixel << 4) | left_pixel;
             
             temp_buffer[dst_byte_pos] = flipped_byte;
@@ -269,6 +271,44 @@ bool check_and_process_render() {
     if (render_requested && received_bytes > 0) {
         Serial.printf("Processing render request for %d bytes\n", received_bytes);
         status_response = 2; // rendering
+        
+        // DEBUG: Check where our data actually starts and ends
+        Serial.println("=== DEBUGGING IMAGE BUFFER CONTENT ===");
+        
+        // Find first non-zero byte
+        uint32_t first_data = 0;
+        for (uint32_t i = 0; i < received_bytes; i++) {
+            if (image_buffer[i] != 0) {
+                first_data = i;
+                break;
+            }
+        }
+        
+        // Find last non-zero byte
+        uint32_t last_data = 0;
+        for (uint32_t i = received_bytes - 1; i > 0; i--) {
+            if (image_buffer[i] != 0) {
+                last_data = i;
+                break;
+            }
+        }
+        
+        Serial.printf("Data range: first non-zero at offset %d, last non-zero at offset %d\n", first_data, last_data);
+        Serial.printf("Data span: %d bytes (should be close to 192000)\n", last_data - first_data + 1);
+        
+        // Check if data starts at offset 0
+        if (first_data > 1000) {
+            Serial.printf("WARNING: Data doesn't start near offset 0! Gap of %d bytes\n", first_data);
+        }
+        
+        // Sample some bytes from different positions
+        Serial.printf("Sample bytes: [0]=%02X, [%d]=%02X, [%d]=%02X, [%d]=%02X\n", 
+                     image_buffer[0], 
+                     received_bytes/4, image_buffer[received_bytes/4],
+                     received_bytes/2, image_buffer[received_bytes/2],
+                     received_bytes*3/4, image_buffer[received_bytes*3/4]);
+        
+        Serial.println("========================================");
         
         // Apply BMP reordering if needed
         if (bmp_reorder_needed) {
