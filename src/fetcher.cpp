@@ -88,25 +88,56 @@ unsigned long errorCount = 0;
 
 // Convert RGB values to e-paper color index (from GUI_BMPfile.cpp algorithm)
 uint8_t rgbToEpaperColor(uint8_t r, uint8_t g, uint8_t b) {
-  // Use the exact color mapping from GUI_BMPfile.cpp
+  // Correct Waveshare 7.3" F e-paper color mapping
+  // Based on Waveshare documentation and actual color values
+  
   if(r == 0 && g == 0 && b == 0){
     return EPD_7IN3F_BLACK;    // 0 - Black
   }else if(r == 255 && g == 255 && b == 255){
     return EPD_7IN3F_WHITE;    // 1 - White  
   }else if(r == 0 && g == 255 && b == 0){
     return EPD_7IN3F_GREEN;    // 2 - Green
-  }else if(r == 255 && g == 0 && b == 0){
-    return EPD_7IN3F_BLUE;     // 3 - Blue
   }else if(r == 0 && g == 0 && b == 255){
-    return EPD_7IN3F_RED;      // 4 - Red
-  }else if(r == 0 && g == 255 && b == 255){
-    return EPD_7IN3F_YELLOW;   // 5 - Yellow
-  }else if(r == 0 && g == 128 && b == 255){
-    return EPD_7IN3F_ORANGE;   // 6 - Orange
+    return EPD_7IN3F_BLUE;     // 3 - Blue 
+  }else if(r == 255 && g == 0 && b == 0){
+    return EPD_7IN3F_RED;      // 4 - Red 
+  }else if(r == 255 && g == 255 && b == 0){
+    return EPD_7IN3F_YELLOW;   // 5 - Yellow 
+  }else if(r == 255 && g == 165 && b == 0){
+    return EPD_7IN3F_ORANGE;   // 6 - Orange 
   }
   
-  // Default to white for unknown colors
-  return EPD_7IN3F_WHITE;
+  // For non-exact matches, find closest color
+  // This handles indexed BMPs with approximate colors
+  uint32_t min_distance = UINT32_MAX;
+  uint8_t best_color = EPD_7IN3F_WHITE;
+  
+  // Color distance calculation helper
+  auto color_distance = [](uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2) -> uint32_t {
+    int dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
+    return dr*dr + dg*dg + db*db;
+  };
+  
+  // Check distance to each e-paper color
+  struct { uint8_t r, g, b, color; } colors[] = {
+    {0,   0,   0,   EPD_7IN3F_BLACK},
+    {255, 255, 255, EPD_7IN3F_WHITE},
+    {0,   255, 0,   EPD_7IN3F_GREEN},
+    {0,   0,   255, EPD_7IN3F_BLUE},    // Keep standard blue
+    {255, 0,   0,   EPD_7IN3F_RED},
+    {255, 255, 0,   EPD_7IN3F_YELLOW},
+    {255, 165, 0,   EPD_7IN3F_ORANGE}   // More standard orange (255,165,0)
+  };
+  
+  for (auto& c : colors) {
+    uint32_t distance = color_distance(r, g, b, c.r, c.g, c.b);
+    if (distance < min_distance) {
+      min_distance = distance;
+      best_color = c.color;
+    }
+  }
+  
+  return best_color;
 }
 
 // Convert palette index to RGB using BMP palette
@@ -694,6 +725,19 @@ bool downloadAndConvertBmpImage(const char* url) {
         }
         
         Serial.printf("✓ Successfully read BMP palette (%d bytes)\n", palette_read);
+        
+        // DEBUG: Print first 10 palette entries to verify colors
+        Serial.println("=== PALETTE DEBUG (first 10 colors) ===");
+        for (int i = 0; i < 10 && i < 256; i++) {
+          uint32_t offset = i * 4;
+          uint8_t b = palette_buffer[offset];
+          uint8_t g = palette_buffer[offset + 1]; 
+          uint8_t r = palette_buffer[offset + 2];
+          uint8_t epaper_color = rgbToEpaperColor(r, g, b);
+          Serial.printf("Palette[%d]: RGB(%d,%d,%d) -> e-paper color %d\n", i, r, g, b, epaper_color);
+        }
+        Serial.println("========================================");
+        
         bytes_read_so_far += palette_size;
       }
       
@@ -990,7 +1034,7 @@ void loop() {
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
     if (status == STATUS_READY || status == STATUS_ERROR) {
-      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella_800x480.bmp";
+      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/pattern_indexed.bmp";
       
       Serial.printf("Converting and streaming BMP from: %s\n", imageUrl);
       if (downloadAndConvertBmpImage(imageUrl)) {
