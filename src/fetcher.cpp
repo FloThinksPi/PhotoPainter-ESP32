@@ -1034,7 +1034,7 @@ void loop() {
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
     if (status == STATUS_READY || status == STATUS_ERROR) {
-      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/pattern_indexed.bmp";
+      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella.bmp";
       
       Serial.printf("Converting and streaming BMP from: %s\n", imageUrl);
       if (downloadAndConvertBmpImage(imageUrl)) {

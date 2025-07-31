@@ -44,11 +44,13 @@ EPAPER_PALETTE = [
     (0, 0, 255),      # Blue
     (255, 0, 0),      # Red
     (255, 255, 0),    # Yellow
-    (255, 128, 0),    # Orange
+    (255, 165, 0),    # Orange (standard web color)
 ]
 
 # Extend palette to 256 colors (PIL requirement)
-FULL_PALETTE = EPAPER_PALETTE + [(0, 0, 0)] * (256 - len(EPAPER_PALETTE))
+def create_full_palette(base_palette):
+    """Create a full 256-color palette from base colors."""
+    return base_palette + [(0, 0, 0)] * (256 - len(base_palette))
 
 def create_argument_parser():
     """Create and configure the argument parser."""
@@ -79,15 +81,36 @@ def create_argument_parser():
     parser.add_argument(
         '--mode', 
         choices=['scale', 'crop', 'stretch'], 
-        default='scale',
+        default='crop',
         help='Resize mode: scale (fit with padding), crop (fill and crop), stretch (distort to fit)'
     )
     
     parser.add_argument(
         '--dither', 
-        choices=['none', 'floyd'], 
-        default='floyd',
-        help='Dithering algorithm: none or floyd-steinberg'
+        choices=['none', 'floyd', 'enhanced'], 
+        default='enhanced',
+        help='Dithering algorithm: none, floyd-steinberg, or enhanced (brightens and enhances colors before dithering)'
+    )
+    
+    parser.add_argument(
+        '--brightness',
+        type=float,
+        default=1,
+        help='Brightness enhancement factor for enhanced dithering (default: 1.0 = +0%%)'
+    )
+    
+    parser.add_argument(
+        '--contrast',
+        type=float,
+        default=1.15,
+        help='Contrast enhancement factor for enhanced dithering (default: 1.15 = +15%%)'
+    )
+    
+    parser.add_argument(
+        '--saturation',
+        type=float,
+        default=1.40,
+        help='Color saturation enhancement factor for enhanced dithering (default: 1.40 = +40%%)'
     )
     
     parser.add_argument(
@@ -221,23 +244,52 @@ def resize_image(image, target_size, mode, quality_filter):
     else:
         raise ValueError(f"Unknown resize mode: {mode}")
 
-def apply_epaper_palette(image, use_dither):
-    """Apply e-paper 7-color palette with optional dithering."""
+def enhance_image_for_epaper(image, brightness=1.25, contrast=1.1, color_saturation=1.25):
+    """Enhance image brightness, contrast, and color saturation for better e-paper results."""
+    from PIL import ImageEnhance
+    
+    # Enhance brightness (25% increase)
+    brightness_enhancer = ImageEnhance.Brightness(image)
+    enhanced_image = brightness_enhancer.enhance(brightness)
+    
+    # Enhance contrast (10% increase)
+    contrast_enhancer = ImageEnhance.Contrast(enhanced_image)
+    enhanced_image = contrast_enhancer.enhance(contrast)
+    
+    # Enhance color saturation (25% increase)
+    color_enhancer = ImageEnhance.Color(enhanced_image)
+    enhanced_image = color_enhancer.enhance(color_saturation)
+    
+    return enhanced_image
+
+def apply_epaper_palette(image, dither_mode, brightness=1.25, contrast=1.1, saturation=1.25):
+    """Apply e-paper 7-color palette with enhanced image processing."""
+    
+    # Create full 256-color palette
+    full_palette = create_full_palette(EPAPER_PALETTE)
+    
     # Create palette image
     palette_image = Image.new("P", (1, 1))
     
     # Flatten the palette for PIL
     flat_palette = []
-    for color in FULL_PALETTE:
+    for color in full_palette:
         flat_palette.extend(color)
     
     palette_image.putpalette(flat_palette)
     
-    # Convert dither setting
-    dither_mode = Image.FLOYDSTEINBERG if use_dither else Image.NONE
+    # Handle different dither modes
+    if dither_mode == 'none':
+        dither_setting = Image.NONE
+    elif dither_mode == 'enhanced':
+        # Enhanced mode: brighten, increase contrast and color saturation before dithering
+        image = enhance_image_for_epaper(image, brightness=brightness, contrast=contrast, color_saturation=saturation)
+        dither_setting = Image.FLOYDSTEINBERG
+    else:  # floyd (standard)
+        dither_setting = Image.FLOYDSTEINBERG
     
     # Apply quantization with palette
-    quantized = image.quantize(dither=dither_mode, palette=palette_image)
+    quantized = image.quantize(dither=dither_setting, palette=palette_image)
     
     # Return as indexed color image (P mode) instead of RGB
     # This will create much smaller BMP files (8-bit per pixel instead of 24-bit)
@@ -295,7 +347,12 @@ def main():
             if args.verbose:
                 print(f"🎯 Target size: {target_size[0]}x{target_size[1]} ({args.orientation})")
                 print(f"🔧 Resize mode: {args.mode}")
-                print(f"🎨 Dithering: {'Floyd-Steinberg' if args.dither == 'floyd' else 'None'}")
+                dither_desc = {
+                    'none': 'None', 
+                    'floyd': 'Floyd-Steinberg (standard)', 
+                    'enhanced': f'Enhanced (+{(args.brightness-1)*100:.0f}% brightness, +{(args.contrast-1)*100:.0f}% contrast, +{(args.saturation-1)*100:.0f}% saturation)'
+                }
+                print(f"🎨 Dithering: {dither_desc.get(args.dither, args.dither)}")
                 print(f"📦 Format: {'8-bit indexed' if args.format == 'indexed' else '24-bit RGB'}")
             
             # Resize image
@@ -304,8 +361,7 @@ def main():
             print_image_info(resized_image, "Resized image", args.verbose)
             
             # Apply e-paper palette
-            use_dither = (args.dither == 'floyd')
-            final_image = apply_epaper_palette(resized_image, use_dither)
+            final_image = apply_epaper_palette(resized_image, args.dither, args.brightness, args.contrast, args.saturation)
             
             # Convert to RGB if requested (for compatibility)
             if args.format == 'rgb':

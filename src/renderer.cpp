@@ -266,96 +266,85 @@ void reorderBmpToDisplay() {
     Serial.println("✓ BMP reordering completed - image is now in display format");
 }
 
-// Check if render is requested and process it
-bool check_and_process_render() {
-    if (render_requested && received_bytes > 0) {
-        Serial.printf("Processing render request for %d bytes\n", received_bytes);
-        status_response = 2; // rendering
-        
-        // DEBUG: Check where our data actually starts and ends
-        Serial.println("=== DEBUGGING IMAGE BUFFER CONTENT ===");
-        
-        // Find first non-zero byte
-        uint32_t first_data = 0;
-        for (uint32_t i = 0; i < received_bytes; i++) {
-            if (image_buffer[i] != 0) {
-                first_data = i;
-                break;
-            }
-        }
-        
-        // Find last non-zero byte
-        uint32_t last_data = 0;
-        for (uint32_t i = received_bytes - 1; i > 0; i--) {
-            if (image_buffer[i] != 0) {
-                last_data = i;
-                break;
-            }
-        }
-        
-        Serial.printf("Data range: first non-zero at offset %d, last non-zero at offset %d\n", first_data, last_data);
-        Serial.printf("Data span: %d bytes (should be close to 192000)\n", last_data - first_data + 1);
-        
-        // Check if data starts at offset 0
-        if (first_data > 1000) {
-            Serial.printf("WARNING: Data doesn't start near offset 0! Gap of %d bytes\n", first_data);
-        }
-        
-        // Sample some bytes from different positions
-        Serial.printf("Sample bytes: [0]=%02X, [%d]=%02X, [%d]=%02X, [%d]=%02X\n", 
-                     image_buffer[0], 
-                     received_bytes/4, image_buffer[received_bytes/4],
-                     received_bytes/2, image_buffer[received_bytes/2],
-                     received_bytes*3/4, image_buffer[received_bytes*3/4]);
-        
-        Serial.println("========================================");
-        
-        // Apply BMP reordering if needed
-        if (bmp_reorder_needed) {
-            Serial.println("BMP reordering requested - converting from BMP order to display order");
-            reorderBmpToDisplay();
-            bmp_reorder_needed = false; // Reset flag
-        }
-        
-        // Expected size for e-paper display: 800x480 pixels, 4 bits per pixel = 192,000 bytes
-        const uint32_t expected_size = 192000;
-        
-        // Try to call the actual display function with received data
-        Serial.printf("Calling EPD_7in3f_display_with_data with %d bytes of received image data...\n", received_bytes);
-        Serial.printf("Expected size: %d bytes, received: %d bytes, difference: %d bytes\n", 
-                     expected_size, received_bytes, (int)(expected_size - received_bytes));
-        
-        // If we're close to the expected size (within 10 bytes), pad with zeros
-        if (received_bytes >= expected_size - 10 && received_bytes <= expected_size) {
-            if (received_bytes < expected_size) {
-                Serial.printf("Padding %d missing bytes with zeros\n", expected_size - received_bytes);
-                memset(&image_buffer[received_bytes], 0, expected_size - received_bytes);
-            }
+// Flip the image horizontally in place
+void flipImageHorizontally() {
+    Serial.println("Flipping image horizontally to correct mirroring...");
+    
+    const uint32_t width = 800;
+    const uint32_t height = 480;
+    const uint32_t bytes_per_row = width / 2; // 400 bytes per row (2 pixels per byte)
+    
+    for (uint32_t y = 0; y < height; y++) {
+        uint32_t row_start = y * bytes_per_row;
+        for (uint32_t x = 0; x < bytes_per_row / 2; x++) {
+            uint32_t left_pos = row_start + x;
+            uint32_t right_pos = row_start + (bytes_per_row - 1 - x);
             
-            // Call the display function with exactly 192,000 bytes
-            int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f);
-            
-            if (display_result == 0) {
-                Serial.printf("✓ Image successfully displayed on e-paper display! (%d bytes)\n", expected_size);
-            } else {
-                Serial.printf("⚠ Display function returned error %d, but continuing\n", display_result);
-            }
-        } else {
-            Serial.printf("⚠ Image size too different from expected (%d vs %d), skipping display\n", 
-                         received_bytes, expected_size);
+            // Swap the bytes at opposite ends of the row
+            uint8_t temp = image_buffer[left_pos];
+            image_buffer[left_pos] = image_buffer[right_pos];
+            image_buffer[right_pos] = temp;
         }
-        
-        Serial.printf("✓ Image rendering completed! (%d bytes processed)\n", received_bytes);
-        
-        // Keep the data and status for a while so fetcher knows we're done
-        status_response = 0; // ready for next image  
-        render_requested = false;
-        render_was_completed = true; // Set the completion flag
-        
-        // Don't reset received_bytes immediately - let it stay for status reporting
-        return true;
     }
-    return false;
+
+    // After swapping bytes, the nibbles (pixels) within each byte are now in the wrong order.
+    // We need to iterate through the entire buffer and swap the nibbles in every byte.
+    for (uint32_t i = 0; i < received_bytes; i++) {
+        uint8_t current_byte = image_buffer[i];
+        image_buffer[i] = ((current_byte & 0x0F) << 4) | ((current_byte & 0xF0) >> 4);
+    }
+
+    Serial.println("✔ Image flipped horizontally");
+}
+
+// Render the image from the buffer
+void renderImage() {
+    // If BMP reordering is needed, do it first
+    if (bmp_reorder_needed) {
+        reorderBmpToDisplay();
+    }
+
+    // Flip the image horizontally before displaying to correct mirroring
+    flipImageHorizontally();
+    
+    Serial.printf("Rendering image from buffer (%d bytes)...\n", received_bytes);
+    
+    // Expected size for e-paper display: 800x480 pixels, 4 bits per pixel = 192,000 bytes
+    const uint32_t expected_size = 192000;
+    
+    // Try to call the actual display function with received data
+    Serial.printf("Calling EPD_7in3f_display_with_data with %d bytes of received image data...\n", received_bytes);
+    Serial.printf("Expected size: %d bytes, received: %d bytes, difference: %d bytes\n", 
+                 expected_size, received_bytes, (int)(expected_size - received_bytes));
+    
+    // If we're close to the expected size (within 10 bytes), pad with zeros
+    if (received_bytes >= expected_size - 10 && received_bytes <= expected_size) {
+        if (received_bytes < expected_size) {
+            Serial.printf("Padding %d missing bytes with zeros\n", expected_size - received_bytes);
+            memset(&image_buffer[received_bytes], 0, expected_size - received_bytes);
+        }
+        
+        // Call the display function with exactly 192,000 bytes
+        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f);
+        
+        if (display_result == 0) {
+            Serial.printf("✓ Image successfully displayed on e-paper display! (%d bytes)\n", expected_size);
+        } else {
+            Serial.printf("⚠ Display function returned error %d, but continuing\n", display_result);
+        }
+    } else {
+        Serial.printf("⚠ Image size too different from expected (%d vs %d), skipping display\n", 
+                     received_bytes, expected_size);
+    }
+    
+    Serial.printf("✓ Image rendering completed! (%d bytes processed)\n", received_bytes);
+    
+    // Keep the data and status for a while so fetcher knows we're done
+    status_response = 0; // ready for next image  
+    render_requested = false;
+    render_was_completed = true; // Set the completion flag
+    
+    // Don't reset received_bytes immediately - let it stay for status reporting
 }
 
 #define enChargingRtc 0
@@ -487,7 +476,8 @@ void setup()
     // Main loop - just wait for I2C commands and process them
     while(1) {
         // Check if we received a render command
-        if (check_and_process_render()) {
+        if (render_requested) {
+            renderImage();
             Serial.printf("✓ Image rendered successfully!\n");
             
             // Celebrate with LED pattern
