@@ -5,6 +5,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>  // For persistent storage of settings
 #include "EPD_7in3f_test.h"  
 #include "led.h"
 #include "waveshare_PCF85063.h" // RTC
@@ -15,6 +16,22 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdarg>
+
+// Forward declarations
+float measureVBAT(void);
+uint8_t getChargingStatus();
+void saveWakeupInterval(uint32_t minutes);
+uint32_t loadWakeupInterval();
+void initPersistentStorage();
+
+// EEPROM addresses for persistent settings
+#define EEPROM_SIZE 512          // Total EEPROM size to initialize
+#define EEPROM_MAGIC_ADDR 0      // Magic number to detect first boot
+#define EEPROM_WAKEUP_ADDR 4     // RTC wakeup interval address (4 bytes)
+#define EEPROM_MAGIC_VALUE 0x12345678  // Magic number for validation
+
+// Default settings
+#define DEFAULT_WAKEUP_MINUTES 30
 
 // Power management variables (simplified) - MAXIMUM POWER EFFICIENCY
 static unsigned long button_press_time = 0;
@@ -29,15 +46,12 @@ static bool last_power_state = false; // Track previous power state (false = bat
 static unsigned long last_power_check = 0;
 static const unsigned long POWER_CHECK_INTERVAL_MS = 2000; // Check power every 2 seconds
 
-// RTC wake-up configuration - EASILY CONFIGURABLE
-// Common wake-up intervals (uncomment the one you want):
-// static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 15;  // Every 15 minutes
-// static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 30;  // Every 30 minutes  
-// static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 60;  // Every 1 hour
-// static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 120; // Every 2 hours
-// static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 360; // Every 6 hours
-static const unsigned long RTC_WAKEUP_INTERVAL_MINUTES = 30; // Wake up every 30 minutes (change this value as needed)
-static const unsigned long RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000; // Convert to milliseconds
+// RTC wake-up configuration - NOW PERSISTENT!
+// The wakeup interval is loaded from EEPROM on startup and saved when changed
+// Common wake-up intervals for reference:
+// 15 minutes, 30 minutes, 60 minutes (1 hour), 120 minutes (2 hours), 360 minutes (6 hours)
+static unsigned long RTC_WAKEUP_INTERVAL_MINUTES; // Will be loaded from EEPROM on startup
+static unsigned long RTC_WAKEUP_INTERVAL_MS; // Calculated from minutes
 
 // I2C command definitions for slave mode
 #define CMD_WRITE_CHUNK       0x01
@@ -45,6 +59,11 @@ static const unsigned long RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES 
 #define CMD_GET_STATUS        0x03
 #define CMD_WRITE_CHUNK_ADDR  0x04  // Write chunk to specific address offset
 #define CMD_RENDER_BMP_ORDER  0x05  // Render image data that's in BMP order (needs reordering)
+#define CMD_GET_BATTERY       0x06  // Get battery voltage
+#define CMD_GET_WAKEUP        0x07  // Get RTC wakeup interval in minutes
+#define CMD_SET_WAKEUP        0x08  // Set RTC wakeup interval in minutes
+#define CMD_GET_CHARGING      0x09  // Get charging status (0=not charging, 1=charging, 2=charge complete)
+#define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
 
 // I2C Pin Configuration for Pi Pico (SLAVE) - ULTRA-OPTIMIZED
 #define I2C_SDA_PIN 4    // Pi Pico GPIO 4 (I2C0 SDA) -> ESP32 GPIO 21 (SDA)  
@@ -175,6 +194,68 @@ void onI2CReceive(int bytes) {
                 // Status will be sent on next request
                 break;
                 
+            case CMD_GET_BATTERY: {
+                // Get battery voltage command - response will be sent via onI2CRequest
+                status_response = 0x80; // Special status to indicate battery voltage response
+                break;
+            }
+                
+            case CMD_GET_WAKEUP: {
+                // Get RTC wakeup interval - response will be sent via onI2CRequest  
+                status_response = 0x81; // Special status to indicate wakeup interval response
+                break;
+            }
+                
+            case CMD_SET_WAKEUP: {
+                if (bytes >= 4) { // Need 4 bytes for new wakeup interval in minutes
+                    uint32_t new_interval = 0;
+                    new_interval |= ((uint32_t)Wire.read()) << 24;
+                    new_interval |= ((uint32_t)Wire.read()) << 16;
+                    new_interval |= ((uint32_t)Wire.read()) << 8;
+                    new_interval |= Wire.read();
+                    
+                    // Validate interval (5 minutes to 24 hours)
+                    if (new_interval >= 5 && new_interval <= 1440) {
+                        RTC_WAKEUP_INTERVAL_MINUTES = new_interval;
+                        RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000;
+                        
+                        // SAVE TO PERSISTENT STORAGE
+                        saveWakeupInterval(new_interval);
+                        
+                        Serial.printf("✓ RTC wakeup interval updated to %lu minutes and SAVED to EEPROM\n", RTC_WAKEUP_INTERVAL_MINUTES);
+                        status_response = 0x82; // Success response for set wakeup
+                    } else {
+                        Serial.printf("⚠ Invalid wakeup interval: %lu minutes (must be 5-1440)\n", new_interval);
+                        status_response = 0x83; // Error response for set wakeup
+                    }
+                } else {
+                    // Flush remaining bytes for malformed command
+                    while (Wire.available()) Wire.read();
+                    status_response = 0x83; // Error response
+                }
+                break;
+            }
+                
+            case CMD_GET_CHARGING: {
+                // Get charging status - response will be sent via onI2CRequest
+                status_response = 0x84; // Special status to indicate charging status response
+                break;
+            }
+                
+            case CMD_SLEEP_NOW: {
+                // Put renderer to sleep immediately after brief delay
+                Serial.printf("💤 SLEEP command received from fetcher - powering off immediately\n");
+                status_response = 0x85; // Sleep command acknowledged
+                
+                // Set up RTC wake-up before sleeping
+                updateRTCWakeup();
+                
+                // Brief delay to send I2C response, then sleep
+                DEV_Delay_ms(100);
+                powerOff();
+                break;
+            }
+                
             default:
                 Serial.printf("Unknown command: 0x%02X\n", command);
                 // Flush remaining bytes
@@ -185,8 +266,30 @@ void onI2CReceive(int bytes) {
 }
 
 void onI2CRequest() {
-    // Send status response
-    Wire.write(status_response);
+    if (status_response == 0x80) {
+        // Send battery voltage as 4-byte float
+        float voltage = measureVBAT();
+        uint8_t* voltage_bytes = (uint8_t*)&voltage;
+        Wire.write(voltage_bytes, 4);
+        status_response = 0; // Reset to ready status
+    } else if (status_response == 0x81) {
+        // Send RTC wakeup interval as 4-byte uint32_t (in minutes)
+        uint32_t interval = RTC_WAKEUP_INTERVAL_MINUTES;
+        Wire.write((uint8_t*)&interval, 4);
+        status_response = 0; // Reset to ready status
+    } else if (status_response == 0x84) {
+        // Send charging status as single byte
+        uint8_t charging_status = getChargingStatus();
+        Wire.write(charging_status);
+        status_response = 0; // Reset to ready status
+    } else if (status_response == 0x85) {
+        // Sleep command acknowledged
+        Wire.write(0x85);
+        // Don't reset status - device will power off shortly
+    } else {
+        // Send regular status response
+        Wire.write(status_response);
+    }
 }
 
 // Initialize I2C as slave using Arduino Wire library - ULTRA-OPTIMIZED
@@ -289,6 +392,19 @@ void disablePowerAwareWatchdog() {
 
 bool isExternalPowerConnected() {
     return DEV_Digital_Read(VBUS) != 0; // VBUS high = external power connected
+}
+
+// Get charging status: 0=not charging, 1=charging, 2=charge complete, 3=no external power
+uint8_t getChargingStatus() {
+    if (!DEV_Digital_Read(VBUS)) {
+        return 3; // No external power connected
+    }
+    
+    if (!DEV_Digital_Read(CHARGE_STATE)) {
+        return 1; // Battery is charging
+    } else {
+        return 2; // Charge complete (external power connected but not charging)
+    }
 }
 
 void updatePowerAwareWatchdog() {
@@ -633,6 +749,61 @@ void run_display(Time_data Time, Time_data alarmTime)
     rtcRunAlarm(Time, alarmTime);  // RTC run alarm
 }
 
+// ========================================
+// PERSISTENT STORAGE FUNCTIONS
+// ========================================
+
+// Initialize EEPROM and load settings from persistent storage
+void initPersistentStorage() {
+    Serial.println("Initializing persistent storage...");
+    EEPROM.begin(EEPROM_SIZE);
+    
+    // Check if this is first boot by reading magic number
+    uint32_t magic;
+    EEPROM.get(EEPROM_MAGIC_ADDR, magic);
+    
+    if (magic != EEPROM_MAGIC_VALUE) {
+        // First boot - initialize EEPROM with defaults
+        Serial.println("First boot detected - initializing EEPROM with default settings");
+        EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
+        EEPROM.put(EEPROM_WAKEUP_ADDR, (uint32_t)DEFAULT_WAKEUP_MINUTES);
+        EEPROM.commit();
+        RTC_WAKEUP_INTERVAL_MINUTES = DEFAULT_WAKEUP_MINUTES;
+    } else {
+        // Load existing settings
+        RTC_WAKEUP_INTERVAL_MINUTES = loadWakeupInterval();
+        Serial.printf("Loaded RTC wakeup interval from EEPROM: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
+    }
+    
+    // Calculate milliseconds from minutes
+    RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000;
+    
+    Serial.printf("✓ Persistent storage initialized - wakeup interval: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
+}
+
+// Save wakeup interval to EEPROM
+void saveWakeupInterval(uint32_t minutes) {
+    Serial.printf("Saving wakeup interval to EEPROM: %lu minutes\n", minutes);
+    EEPROM.put(EEPROM_WAKEUP_ADDR, minutes);
+    EEPROM.commit();
+    Serial.println("✓ Wakeup interval saved to EEPROM");
+}
+
+// Load wakeup interval from EEPROM
+uint32_t loadWakeupInterval() {
+    uint32_t minutes;
+    EEPROM.get(EEPROM_WAKEUP_ADDR, minutes);
+    
+    // Validate loaded value
+    if (minutes < 5 || minutes > 1440) {
+        Serial.printf("Invalid wakeup interval in EEPROM: %lu - using default\n", minutes);
+        minutes = DEFAULT_WAKEUP_MINUTES;
+        saveWakeupInterval(minutes); // Save corrected value
+    }
+    
+    return minutes;
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -640,6 +811,9 @@ void setup()
     
     Serial.printf("=== ULTRA-FAST RENDERER STARTING ===\r\n");
     Serial.printf("MAXIMUM POWER EFFICIENCY MODE\r\n");
+    
+    // Initialize persistent storage first (loads RTC wakeup interval)
+    initPersistentStorage();
     
     // ULTRA-FAST hardware initialization (moved early for RTC access)
     Serial.printf("ULTRA-FAST hardware init...\r\n");

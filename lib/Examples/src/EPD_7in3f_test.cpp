@@ -118,7 +118,7 @@ int EPD_7in3f_display(float vol)
     Paint_SetRotate(270);
     char strvol[21] = {0};
     sprintf(strvol, "%f V", vol);
-    if(vol < 3.3) {
+    if(vol < 4.3) {
         Paint_DrawString_EN(10, 10, "Low voltage, please charge in time.", &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
         Paint_DrawString_EN(10, 26, strvol, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
     }

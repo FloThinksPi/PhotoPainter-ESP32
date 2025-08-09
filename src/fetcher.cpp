@@ -10,10 +10,27 @@
 #include <Wire.h>
 #include <ImageData.h>
 #include <esp_sleep.h> // For deep sleep power management
+#include <WebServer.h> // For web UI
+#include <Preferences.h> // For persistent URL storage
+#include <Update.h> // For OTA firmware updates
 
 // Forward declarations
 bool downloadAndStreamImage(const char* url);
 bool downloadAndConvertBmpImage(const char* url);
+void initUrlStorage();
+void saveUrls();
+String getCurrentUrlAndAdvance();
+bool addUrl(const String& url);
+bool removeUrl(int index);
+bool checkAuthentication();
+void handleLogin();
+void handleLogout();
+void handleDisplayCurrent();
+void handleDisplayImage();
+void handleNextImage();
+String getLoginPage();
+void handleFirmwareUpdate();
+void handleChangePassword();
 
 // E-paper color definitions (4-bit values)
 #define EPD_7IN3F_BLACK   0x0	/// 000
@@ -59,6 +76,23 @@ int I2C_SCL_PIN = 22;   // ESP32 pin 22 connects to Renderer pin 5 (SCL)
  
 WiFiManager wm;
 
+// Web server for configuration UI
+WebServer server(80);
+
+// URL Management
+#define MAX_URLS 10              // Maximum number of URLs to store
+#define MAX_URL_LENGTH 512       // Maximum length per URL
+Preferences preferences;         // For persistent URL storage
+String imageUrls[MAX_URLS];      // Array to hold URLs
+int urlCount = 0;                // Current number of URLs
+int currentUrlIndex = 0;         // Index of current URL being used
+
+// Global variables for web UI display
+float current_battery_voltage = 0.0f;
+uint32_t current_wakeup_interval = 30;
+uint8_t current_charging_status = 3; // 0=not charging, 1=charging, 2=charge complete, 3=no external power
+unsigned long last_status_update = 0;
+
 // ULTRA-OPTIMIZED buffer sizes for maximum power efficiency
 static constexpr size_t BUFFER_SIZE = 1024; // Doubled for faster HTTP reads
 static constexpr size_t STREAM_BUFFER_SIZE = 2048; // Large streaming buffer
@@ -73,6 +107,11 @@ uint32_t totalChunks = (sizeof(Image7color) + CHUNK_SIZE - 1) / CHUNK_SIZE; // T
 #define CMD_RENDER_IMAGE      0x02  
 #define CMD_GET_STATUS        0x03
 #define CMD_RENDER_BMP_ORDER  0x05  // Render image data that's in BMP order (needs reordering)
+#define CMD_GET_BATTERY       0x06  // Get battery voltage
+#define CMD_GET_WAKEUP        0x07  // Get RTC wakeup interval in minutes
+#define CMD_SET_WAKEUP        0x08  // Set RTC wakeup interval in minutes
+#define CMD_GET_CHARGING      0x09  // Get charging status (0=not charging, 1=charging, 2=charge complete)
+#define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
 
 // Status response codes from slave
 #define STATUS_READY          0x00  // Ready for next image
@@ -87,6 +126,13 @@ bool download_success = false;
 
 // Connection monitoring
 unsigned long lastI2CActivity = 0;
+
+// Authentication and security
+String adminPassword = "photoframe2024";  // Default password
+bool isAuthenticated = false;
+unsigned long authTimeout = 0;
+const unsigned long AUTH_TIMEOUT_MS = 900000; // 15 minutes session timeout
+const String MASTER_RESET_PASSWORD = "FACTORY_RESET_ESP32_2024"; // Master recovery password
 unsigned long i2cTransactionCount = 0;
 unsigned long errorCount = 0;
 
@@ -581,10 +627,888 @@ bool initI2C() {
   return true;
 }
 
+// Get battery voltage from Pi Pico
+float getBatteryVoltage() {
+  Serial.println("Requesting battery voltage from Pi Pico...");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_BATTERY);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("Failed to send battery command, error: %d\n", error);
+    return -1.0f;
+  }
+  
+  delay(50); // Give Pi Pico time to prepare response
+  
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 4);
+  if (Wire.available() >= 4) {
+    float voltage;
+    uint8_t* voltage_bytes = (uint8_t*)&voltage;
+    for (int i = 0; i < 4; i++) {
+      voltage_bytes[i] = Wire.read();
+    }
+    Serial.printf("✓ Battery voltage: %.2f V\n", voltage);
+    return voltage;
+  } else {
+    Serial.printf("Failed to read battery voltage response\n");
+    return -1.0f;
+  }
+}
+
+// Get RTC wakeup interval from Pi Pico (in minutes)
+uint32_t getWakeupInterval() {
+  Serial.println("Requesting wakeup interval from Pi Pico...");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_WAKEUP);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("Failed to send wakeup get command, error: %d\n", error);
+    return 0;
+  }
+  
+  delay(50); // Give Pi Pico time to prepare response
+  
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 4);
+  if (Wire.available() >= 4) {
+    uint32_t interval;
+    uint8_t* interval_bytes = (uint8_t*)&interval;
+    for (int i = 0; i < 4; i++) {
+      interval_bytes[i] = Wire.read();
+    }
+    Serial.printf("✓ Current wakeup interval: %lu minutes\n", interval);
+    return interval;
+  } else {
+    Serial.printf("Failed to read wakeup interval response\n");
+    return 0;
+  }
+}
+
+// Set RTC wakeup interval on Pi Pico (in minutes)
+bool setWakeupInterval(uint32_t minutes) {
+  Serial.printf("Setting wakeup interval to %lu minutes...\n", minutes);
+  
+  if (minutes < 5 || minutes > 1440) {
+    Serial.printf("Invalid wakeup interval: %lu (must be 5-1440 minutes)\n", minutes);
+    return false;
+  }
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_SET_WAKEUP);
+  Wire.write((minutes >> 24) & 0xFF);
+  Wire.write((minutes >> 16) & 0xFF);
+  Wire.write((minutes >> 8) & 0xFF);
+  Wire.write(minutes & 0xFF);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("Failed to send wakeup set command, error: %d\n", error);
+    return false;
+  }
+  
+  delay(100); // Give Pi Pico time to process
+  
+  // Check response
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+  if (Wire.available()) {
+    uint8_t response = Wire.read();
+    if (response == 0x82) {
+      Serial.printf("✓ Wakeup interval successfully set to %lu minutes\n", minutes);
+      return true;
+    } else if (response == 0x83) {
+      Serial.printf("Pi Pico rejected wakeup interval: %lu minutes\n", minutes);
+      return false;
+    } else {
+      Serial.printf("Unexpected response from Pi Pico: 0x%02X\n", response);
+      return false;
+    }
+  } else {
+    Serial.printf("No response from Pi Pico for set wakeup command\n");
+    return false;
+  }
+}
+
+// Get charging status from Pi Pico (0=not charging, 1=charging, 2=charge complete, 3=no external power)
+uint8_t getChargingStatus() {
+  Serial.println("Requesting charging status from Pi Pico...");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_CHARGING);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("Failed to send charging status command, error: %d\n", error);
+    return 3; // Assume no external power on communication failure
+  }
+  
+  delay(50); // Give Pi Pico time to prepare response
+  
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+  if (Wire.available()) {
+    uint8_t charging_status = Wire.read();
+    const char* status_text[] = {"Not Charging", "Charging", "Charge Complete", "No External Power"};
+    if (charging_status <= 3) {
+      Serial.printf("✓ Charging status: %s (%d)\n", status_text[charging_status], charging_status);
+    } else {
+      Serial.printf("✓ Charging status: Unknown (%d)\n", charging_status);
+    }
+    return charging_status;
+  } else {
+    Serial.printf("Failed to read charging status response\n");
+    return 3; // Assume no external power on communication failure
+  }
+}
+
+// Put renderer to sleep immediately
+bool putRendererToSleep() {
+  Serial.println("Sending sleep command to Pi Pico...");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_SLEEP_NOW);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("Failed to send sleep command, error: %d\n", error);
+    return false;
+  }
+  
+  delay(50); // Give Pi Pico time to process
+  
+  // Check response
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+  if (Wire.available()) {
+    uint8_t response = Wire.read();
+    if (response == 0x85) {
+      Serial.println("✓ Pi Pico acknowledged sleep command - it should power off shortly");
+      return true;
+    } else {
+      Serial.printf("Unexpected response from sleep command: 0x%02X\n", response);
+      return false;
+    }
+  } else {
+    Serial.printf("No response from Pi Pico for sleep command\n");
+    return false;
+  }
+}
+
+// ========================================
+// AUTHENTICATION AND SECURITY FUNCTIONS
+// ========================================
+
+bool checkAuthentication() {
+  if (isAuthenticated && millis() < authTimeout) {
+    return true;
+  }
+  isAuthenticated = false;
+  return false;
+}
+
+void handleLogin() {
+  if (server.method() == HTTP_POST) {
+    String password = server.arg("password");
+    
+    // Check for master reset password
+    if (password == MASTER_RESET_PASSWORD) {
+      Serial.println("MASTER RESET PASSWORD DETECTED - Starting factory reset...");
+      
+      // Reset admin password to default
+      adminPassword = "photoframe2024";
+      
+      // Clear all stored preferences
+      preferences.begin("photoframe", false);
+      preferences.clear();
+      preferences.end();
+      
+      // Clear WiFi credentials (this will force WiFiManager setup on next boot)
+      WiFi.disconnect(true);
+      WiFi.begin("", "");  // Clear stored credentials
+      
+      Serial.println("✓ Admin password reset to: photoframe2024");
+      Serial.println("✓ All URLs and settings cleared");
+      Serial.println("✓ WiFi credentials cleared");
+      Serial.println("✓ Device will restart in 3 seconds...");
+      
+      server.send(200, "text/html; charset=utf-8", 
+        "<html><head><title>Factory Reset</title><meta charset=\"UTF-8\"></head><body style='font-family:Arial;text-align:center;padding:50px'>"
+        "<h1>&#128295; Factory Reset Complete</h1>"
+        "<p>All settings have been reset to factory defaults:</p>"
+        "<ul style='text-align:left;max-width:400px;margin:20px auto'>"
+        "<li>Admin password: <b>photoframe2024</b></li>"
+        "<li>All URLs cleared</li>"
+        "<li>WiFi credentials cleared</li>"
+        "<li>All preferences reset</li>"
+        "</ul>"
+        "<p><b>Device will restart automatically...</b></p>"
+        "<p>After restart, connect to WiFi setup portal to reconfigure.</p>"
+        "</body></html>");
+      
+      delay(3000);
+      ESP.restart();
+      return;
+    }
+    
+    // Normal password check
+    if (password == adminPassword) {
+      isAuthenticated = true;
+      authTimeout = millis() + AUTH_TIMEOUT_MS;
+      server.send(200, "text/plain", "OK");
+    } else {
+      delay(2000); // Prevent brute force attacks
+      server.send(401, "text/plain", "Unauthorized");
+    }
+  } else {
+    server.send(405, "text/plain", "Method not allowed");
+  }
+}
+
+void handleLogout() {
+  isAuthenticated = false;
+  authTimeout = 0;
+  server.send(200, "text/plain", "Logged out");
+}
+
+String getLoginPage() {
+  return R"(<html><head><title>Login</title><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="UTF-8">
+<style>body{font-family:Arial;margin:0;padding:0;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);height:100vh;display:flex;align-items:center;justify-content:center}
+.login{background:white;padding:40px;border-radius:15px;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-width:400px;width:100%}
+h1{color:#333;text-align:center;margin-bottom:30px}input{width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0}
+input:focus{outline:none;border-color:#4CAF50}.btn{width:100%;padding:12px;background:#4CAF50;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer}
+.btn:hover{background:#45a049}.error{color:#d32f2f;text-align:center;margin-top:10px;display:none}
+.reset-info{background:#fff3e0;padding:15px;margin-top:20px;border-radius:8px;border-left:4px solid #FF9800;font-size:12px}
+.reset-info h3{margin:0 0 10px 0;color:#F57C00}.reset-info ul{margin:10px 0;padding-left:20px}.reset-info li{margin:5px 0}
+</style></head><body><div class="login"><h1>&#128444;&#65039; Login</h1>
+<form id="f"><input type="password" id="p" placeholder="Password" required><button type="submit" class="btn" id="loginBtn">Login</button><div id="e" class="error">Invalid password</div></form>
+<div class="reset-info"><h3>&#128198; Forgot Password?</h3><p>Enter master reset password to restore factory settings:</p>
+<ul><li>Resets admin password to: <b>photoframe2024</b></li><li>Clears all URLs and settings</li><li>Removes WiFi credentials</li><li>Forces device restart and WiFi setup</li></ul>
+<p><b>Master reset password:</b><br><code style="background:#f5f5f5;padding:2px 6px;border-radius:3px;font-family:monospace">FACTORY_RESET_ESP32_2024</code></p></div></div>
+<script>
+document.getElementById('f').onsubmit=function(e){
+  e.preventDefault();
+  const btn=document.getElementById('loginBtn');
+  const pwd=document.getElementById('p');
+  const err=document.getElementById('e');
+  
+  btn.disabled=true;
+  btn.textContent='Logging in...';
+  err.style.display='none';
+  
+  fetch('/login',{
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'password='+encodeURIComponent(pwd.value),
+    timeout: 10000
+  })
+  .then(response => {
+    if(response.ok) {
+      btn.textContent='Success!';
+      window.location.href='/';
+    } else {
+      throw new Error('Invalid password');
+    }
+  })
+  .catch(error => {
+    console.error('Login error:', error);
+    err.textContent = error.message.includes('timeout') || error.message.includes('ERR_CONNECTION') ? 
+      'Connection timeout - check device connection' : 'Login failed - check password';
+    err.style.display='block';
+    pwd.value='';
+    btn.disabled=false;
+    btn.textContent='Login';
+  });
+};
+</script></body></html>)";
+}
+
+// ========================================
+// FIRMWARE UPDATE FUNCTIONS
+// ========================================
+
+void handleFirmwareUpdate() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  HTTPUpload& upload = server.upload();
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("Firmware update started: %s\n", upload.filename.c_str());
+    
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+      server.send(500, "text/plain", "Update failed to start");
+      return;
+    }
+  } 
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+      server.send(500, "text/plain", "Update write failed");
+      return;
+    }
+  } 
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("Firmware update success: %u bytes\n", upload.totalSize);
+      server.send(200, "text/plain", "Update successful! Device will restart in 3 seconds.");
+      delay(3000);
+      ESP.restart();
+    } else {
+      Update.printError(Serial);
+      server.send(500, "text/plain", "Update failed to complete");
+    }
+  }
+}
+
+// ========================================
+// URL MANAGEMENT FUNCTIONS
+// ========================================
+
+// Initialize URL storage and load existing URLs
+void initUrlStorage() {
+  Serial.println("Initializing URL storage...");
+  preferences.begin("photoframe", false);
+  
+  // Load URL count
+  urlCount = preferences.getInt("urlCount", 0);
+  currentUrlIndex = preferences.getInt("currentIdx", 0);
+  
+  if (urlCount == 0) {
+    // First time setup - add default URL
+    Serial.println("No URLs found - adding default URL");
+    imageUrls[0] = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella.bmp";
+    urlCount = 1;
+    currentUrlIndex = 0;
+    saveUrls();
+  } else {
+    // Load existing URLs
+    for (int i = 0; i < urlCount && i < MAX_URLS; i++) {
+      String key = "url" + String(i);
+      imageUrls[i] = preferences.getString(key.c_str(), "");
+      Serial.printf("Loaded URL %d: %s\n", i, imageUrls[i].c_str());
+    }
+  }
+  
+  // Validate current index
+  if (currentUrlIndex >= urlCount) {
+    currentUrlIndex = 0;
+  }
+  
+  // Load admin password (initialize if not set)
+  adminPassword = preferences.getString("password", "photoframe2024");
+  Serial.printf("✓ Admin password loaded from storage\n");
+  
+  Serial.printf("✓ URL storage initialized: %d URLs, current index: %d\n", urlCount, currentUrlIndex);
+}
+
+// Save URLs to persistent storage
+void saveUrls() {
+  preferences.putInt("urlCount", urlCount);
+  preferences.putInt("currentIdx", currentUrlIndex);
+  
+  for (int i = 0; i < urlCount; i++) {
+    String key = "url" + String(i);
+    preferences.putString(key.c_str(), imageUrls[i]);
+  }
+  
+  Serial.printf("✓ Saved %d URLs to storage\n", urlCount);
+}
+
+// Get the current URL and advance to next
+String getCurrentUrlAndAdvance() {
+  if (urlCount == 0) {
+    return "";
+  }
+  
+  String currentUrl = imageUrls[currentUrlIndex];
+  
+  // Advance to next URL
+  currentUrlIndex = (currentUrlIndex + 1) % urlCount;
+  preferences.putInt("currentIdx", currentUrlIndex);
+  
+  Serial.printf("Using URL %d/%d: %s\n", (currentUrlIndex == 0 ? urlCount : currentUrlIndex), urlCount, currentUrl.c_str());
+  Serial.printf("Next URL will be index %d\n", currentUrlIndex);
+  
+  return currentUrl;
+}
+
+// Add a new URL
+bool addUrl(const String& url) {
+  if (urlCount >= MAX_URLS) {
+    Serial.println("Cannot add URL - maximum reached");
+    return false;
+  }
+  
+  if (url.length() > MAX_URL_LENGTH) {
+    Serial.println("Cannot add URL - too long");
+    return false;
+  }
+  
+  // Check if URL already exists
+  for (int i = 0; i < urlCount; i++) {
+    if (imageUrls[i].equals(url)) {
+      Serial.println("URL already exists");
+      return false;
+    }
+  }
+  
+  imageUrls[urlCount] = url;
+  urlCount++;
+  saveUrls();
+  
+  Serial.printf("✓ Added URL %d: %s\n", urlCount, url.c_str());
+  return true;
+}
+
+// Remove a URL by index
+bool removeUrl(int index) {
+  if (index < 0 || index >= urlCount) {
+    return false;
+  }
+  
+  // Shift remaining URLs down
+  for (int i = index; i < urlCount - 1; i++) {
+    imageUrls[i] = imageUrls[i + 1];
+  }
+  
+  urlCount--;
+  
+  // Adjust current index if needed
+  if (currentUrlIndex >= urlCount && urlCount > 0) {
+    currentUrlIndex = 0;
+  }
+  
+  saveUrls();
+  
+  Serial.printf("✓ Removed URL at index %d, %d URLs remaining\n", index, urlCount);
+  return true;
+}
+
+// HTML for the web UI
+const char* getWebUI() {
+  static String html; // Use String instead of fixed buffer to avoid truncation
+  
+  // Generate URL list HTML
+  String urlListHtml = "";
+  for (int i = 0; i < urlCount; i++) {
+    bool isCurrent = (i == currentUrlIndex); // Check if this is the current URL
+    urlListHtml += "<div class=\"url-item" + String(isCurrent ? " current" : "") + "\">";
+    urlListHtml += "<div class=\"url-idx" + String(isCurrent ? " current" : "") + "\">" + String(i + 1) + "</div>";
+    if (isCurrent) {
+      urlListHtml += "<div class=\"url-current\">ACTIVE</div>";
+    }
+    urlListHtml += "<div class=\"url-text\">" + imageUrls[i] + "</div>";
+    urlListHtml += "<div class=\"url-controls\">";
+    urlListHtml += "<button class=\"display-single\" onclick=\"displayImage(" + String(i) + ")\">&#128444;</button>";
+    urlListHtml += "<button class=\"del\" onclick=\"deleteUrl(" + String(i) + ")\">&#128465;</button>";
+    urlListHtml += "</div>";
+    urlListHtml += "</div>";
+  }
+  
+  // Get IP address string safely
+  String ipAddress = WiFi.localIP().toString();
+  
+  html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>PhotoFrame Control Panel</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<style>";
+  html += "body{font-family:Arial;margin:20px;background:#f0f0f0}";
+  html += ".c{max-width:900px;margin:0 auto;background:white;padding:20px;border-radius:10px}";
+  html += "h1{color:#333;text-align:center;border-bottom:2px solid #4CAF50;padding-bottom:10px}";
+  html += "h2{color:#333;border-bottom:1px solid #ddd;padding-bottom:5px}";
+  html += ".card{background:#e8f5e8;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #4CAF50}";
+  html += ".i{margin:10px 0}";
+  html += ".good{color:#4CAF50;font-weight:bold}.low{color:#FF9800;font-weight:bold}.crit{color:#f44336;font-weight:bold}";
+  html += ".f{margin:15px 0}";
+  html += "input{width:100%;padding:10px;border:2px solid #ddd;border-radius:5px;font-size:14px;box-sizing:border-box}";
+  html += "button{padding:10px 15px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin:5px 5px 5px 0;background:#4CAF50;color:white;transition:all 0.3s}";
+  html += ".logout{background:#FF9800;float:right}.del{background:#f44336;padding:8px 12px;font-size:12px}.add{background:#2196F3}.display{background:#9C27B0}.next{background:#FF5722}.display-single{background:#4CAF50;padding:8px 12px;font-size:12px}";
+  html += "button:hover{opacity:0.8;transform:translateY(-1px)}";
+  html += ".url-item{background:#fff;padding:15px;margin:8px 0;border:2px solid #ddd;border-radius:8px;display:flex;align-items:center;transition:all 0.3s}";
+  html += ".url-item:hover{border-color:#4CAF50;box-shadow:0 2px 8px rgba(0,0,0,0.1)}";
+  html += ".url-item.current{border-color:#4CAF50;background:#f8fff8;box-shadow:0 2px 8px rgba(76,175,80,0.2)}";
+  html += ".url-idx{background:#666;color:white;border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;font-weight:bold;margin-right:15px}";
+  html += ".url-idx.current{background:#4CAF50}";
+  html += ".url-current{color:#4CAF50;font-weight:bold;font-size:11px;margin:0 10px;padding:2px 8px;background:#e8f5e8;border-radius:12px}";
+  html += ".url-text{flex:1;font-family:monospace;font-size:13px;word-break:break-all;margin-right:15px;line-height:1.4}";
+  html += ".url-controls{display:flex;gap:5px}";
+  html += ".control-section{background:#f3e5f5;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #9C27B0}";
+  html += ".sec{background:#fff3e0;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #FF9800}";
+  html += ".up{background:#e3f2fd;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #2196F3}";
+  html += ".status-msg{padding:10px;margin:10px 0;border-radius:5px;font-weight:bold}";
+  html += ".status-success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}";
+  html += ".status-error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}";
+  html += "</style></head><body><div class=\"c\">";
+  
+  html += "<h1>&#128248; PhotoFrame Control Panel</h1><button class=\"logout\" onclick=\"logout()\">Logout</button>";
+  html += "<div class=\"card\"><h2>&#128202; System Status</h2>";
+  html += "<div class=\"i\">&#128267; Battery: <span class=\"" + String((current_battery_voltage > 3.5f) ? "good" : (current_battery_voltage > 3.2f) ? "low" : "crit") + "\">" + String(current_battery_voltage, 2) + "V</span> | &#9889; Charging: " + String((current_charging_status == 0) ? "Not Charging" : (current_charging_status == 1) ? "Charging" : (current_charging_status == 2) ? "Charge Complete" : "No External Power") + "</div>";
+  html += "<div class=\"i\">&#9200; Wakeup: " + String(current_wakeup_interval) + " min | &#127760; IP: " + ipAddress + " | &#128193; URLs: " + String(urlCount) + " (current: #" + String(currentUrlIndex + 1) + ")</div></div>";
+  
+  html += "<div class=\"control-section\"><h2>&#127918; Manual Controls</h2>";
+  html += "<button class=\"display\" onclick=\"displayCurrent()\">&#128444; Display Current Image</button>";
+  html += "<button class=\"next\" onclick=\"nextImage()\">&#9197; Next Image</button>";
+  html += "<div id=\"control-status\"></div></div>";
+  
+  html += "<div class=\"f\"><h2>&#128279; Image URLs</h2>" + urlListHtml;
+  html += "<div style=\"display:flex;gap:10px;margin-top:10px\">";
+  html += "<input type=\"text\" id=\"url\" placeholder=\"https://example.com/image.jpg\" style=\"flex:1\">";
+  html += "<button class=\"add\" onclick=\"addUrl()\" style=\"min-width:80px\">&#10133; Add</button></div></div>";
+  
+  html += "<div class=\"f\"><h2>&#9881; Configuration</h2>";
+  html += "<input type=\"number\" id=\"wake\" min=\"5\" max=\"1440\" value=\"" + String(current_wakeup_interval) + "\" placeholder=\"Wakeup interval (5-1440 minutes)\">";
+  html += "<button onclick=\"update()\">&#128190; Update</button><button onclick=\"refreshPage()\">&#128472; Refresh</button></div>";
+  
+  html += "<div class=\"sec\"><h2>&#128274; Security</h2>";
+  html += "<input type=\"password\" id=\"pwd\" placeholder=\"New Password (8+ characters)\">";
+  html += "<button onclick=\"changePwd()\">&#128273; Change Password</button></div>";
+  
+  html += "<div class=\"up\"><h2>&#128193; Firmware Upload</h2>";
+  html += "<input type=\"file\" id=\"fw\" accept=\".bin\"><button onclick=\"upload()\">&#11014; Upload Firmware</button><div id=\"upload-status\"></div></div>";
+  
+  html += "<div style=\"text-align:center;color:#666;margin-top:20px\">v2.4 | &#9201; " + String(millis() / 1000) + " sec | &#128190; " + String(ESP.getFreeHeap()) + " bytes free</div></div>";
+  
+  // Add JavaScript functions
+  html += "<script>";
+  html += "function logout(){fetch('/logout',{method:'POST'}).then(()=>location.reload())}";
+  html += "function update(){const i=document.getElementById('wake').value;if(i>=5&&i<=1440)fetch('/setWakeup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'minutes='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)});else showStatus('Please enter 5-1440 minutes',false)}";
+  html += "function addUrl(){const u=document.getElementById('url').value;if(u)fetch('/addUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success')){document.getElementById('url').value='';setTimeout(refreshPage,1500)}});else showStatus('Please enter a URL',false)}";
+  html += "function deleteUrl(i){if(confirm('Delete this URL?'))fetch('/deleteUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)})}";
+  html += "function displayImage(i){document.getElementById('control-status').innerHTML='&#128444; Displaying image #'+(i+1)+'...';fetch('/displayImage',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
+  html += "function displayCurrent(){document.getElementById('control-status').innerHTML='&#128444; Displaying current image...';fetch('/displayCurrent',{method:'POST'}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'))})}";
+  html += "function nextImage(){document.getElementById('control-status').innerHTML='&#9197; Loading next image...';fetch('/nextImage',{method:'POST'}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
+  html += "function changePwd(){const p=document.getElementById('pwd').value;if(p.length>=8)fetch('/changePassword',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(p)}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));document.getElementById('pwd').value=''});else showStatus('Password must be at least 8 characters',false)}";
+  html += "function upload(){const f=document.getElementById('fw').files[0];if(!f||!f.name.endsWith('.bin')||f.size>2000000){showUploadStatus('Please select a valid .bin file under 2MB',false);return}if(!confirm('Upload firmware? Device will restart!'))return;const fd=new FormData();fd.append('firmware',f);showUploadStatus('&#128228; Uploading firmware...',true);fetch('/firmware',{method:'POST',body:fd}).then(r=>r.text()).then(d=>showUploadStatus(d,d.includes('success'))).catch(e=>showUploadStatus('X Upload failed',false))}";
+  html += "function refreshPage(){location.reload()}";
+  html += "function showStatus(msg,success){const div=document.createElement('div');div.className='status-msg '+(success?'status-success':'status-error');div.innerHTML=msg;document.body.appendChild(div);setTimeout(()=>div.remove(),4000)}";
+  html += "function showControlStatus(msg,success){document.getElementById('control-status').innerHTML='<div class=\"status-msg '+(success?'status-success':'status-error')+'\">'+msg+'</div>';setTimeout(()=>document.getElementById('control-status').innerHTML='',4000)}";
+  html += "function showUploadStatus(msg,isProgress){document.getElementById('upload-status').innerHTML='<div class=\"status-msg '+(isProgress?'status-success':'status-error')+'\">'+msg+'</div>'}";
+  html += "</script></body></html>";
+  
+  // Debug: Check HTML length
+  Serial.printf("✓ HTML generated successfully: %d bytes\n", html.length());
+  
+  return html.c_str();
+}
+
+// Web server handlers
+void handleRoot() {
+  if (!checkAuthentication()) {
+    server.send(200, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  // Update status from Pi Pico
+  current_battery_voltage = getBatteryVoltage();
+  current_wakeup_interval = getWakeupInterval();
+  current_charging_status = getChargingStatus();
+  last_status_update = millis();
+  
+  server.send(200, "text/html; charset=utf-8", getWebUI());
+}
+
+void handleSetWakeup() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (server.hasArg("minutes")) {
+    uint32_t minutes = server.arg("minutes").toInt();
+    
+    if (setWakeupInterval(minutes)) {
+      current_wakeup_interval = minutes;
+      server.send(200, "text/plain", "Wakeup interval updated successfully!");
+    } else {
+      server.send(400, "text/plain", "Failed to update wakeup interval");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing minutes parameter");
+  }
+}
+
+void handleAddUrl() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (server.hasArg("url")) {
+    String url = server.arg("url");
+    
+    if (addUrl(url)) {
+      server.send(200, "text/plain", "URL added successfully!");
+    } else {
+      server.send(400, "text/plain", "Failed to add URL (duplicate, too long, or maximum reached)");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing URL parameter");
+  }
+}
+
+void handleDeleteUrl() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (server.hasArg("index")) {
+    int index = server.arg("index").toInt();
+    
+    if (removeUrl(index)) {
+      server.send(200, "text/plain", "URL deleted successfully!");
+    } else {
+      server.send(400, "text/plain", "Failed to delete URL (invalid index)");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing index parameter");
+  }
+}
+
+void handleChangePassword() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (server.hasArg("password")) {
+    String newPassword = server.arg("password");
+    
+    if (newPassword.length() >= 8) {
+      adminPassword = newPassword;
+      preferences.begin("photoframe", false);
+      preferences.putString("password", adminPassword);
+      preferences.end();
+      
+      server.send(200, "text/plain", "Password changed successfully!");
+      Serial.println("Admin password updated");
+    } else {
+      server.send(400, "text/plain", "Password must be at least 8 characters long");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing password parameter");
+  }
+}
+
+void handleDisplayCurrent() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  last_status_update = millis();
+  
+  if (urlCount > 0) {
+    Serial.println("🖼️ Manual display request - displaying current image");
+    
+    bool success = downloadAndConvertBmpImage(imageUrls[currentUrlIndex].c_str());
+    
+    if (success) {
+      server.send(200, "text/plain", "✓ Displaying current image: " + imageUrls[currentUrlIndex]);
+    } else {
+      server.send(500, "text/plain", "❌ Failed to display image: " + imageUrls[currentUrlIndex]);
+    }
+  } else {
+    server.send(400, "text/plain", "❌ No URLs configured");
+  }
+}
+
+void handleDisplayImage() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  if (!server.hasArg("index")) {
+    server.send(400, "text/plain", "❌ Missing index parameter");
+    return;
+  }
+  
+  int index = server.arg("index").toInt();
+  
+  if (index < 0 || index >= urlCount) {
+    server.send(400, "text/plain", "❌ Invalid URL index: " + String(index));
+    return;
+  }
+  
+  last_status_update = millis();
+  
+  Serial.printf("🖼️ Manual display request - showing image %d/%d\n", index + 1, urlCount);
+  
+  bool success = downloadAndConvertBmpImage(imageUrls[index].c_str());
+  
+  if (success) {
+    // Update current index to the displayed image
+    currentUrlIndex = index;
+    preferences.begin("photoframe", false);
+    preferences.putInt("currentIndex", currentUrlIndex);
+    preferences.end();
+    
+    server.send(200, "text/plain", "✓ Displaying image " + String(index + 1) + "/" + String(urlCount) + ": " + imageUrls[index]);
+  } else {
+    server.send(500, "text/plain", "❌ Failed to display image " + String(index + 1) + ": " + imageUrls[index]);
+  }
+}
+
+void handleNextImage() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  last_status_update = millis();
+  
+  if (urlCount > 0) {
+    // Advance to next URL
+    currentUrlIndex = (currentUrlIndex + 1) % urlCount;
+    
+    // Save current index
+    preferences.begin("photoframe", false);
+    preferences.putInt("currentIndex", currentUrlIndex);
+    preferences.end();
+    
+    Serial.printf("⏭️ Manual next image - advancing to URL %d/%d\n", currentUrlIndex + 1, urlCount);
+    
+    bool success = downloadAndConvertBmpImage(imageUrls[currentUrlIndex].c_str());
+    
+    if (success) {
+      server.send(200, "text/plain", "✓ Loading next image (" + String(currentUrlIndex + 1) + "/" + String(urlCount) + "): " + imageUrls[currentUrlIndex]);
+    } else {
+      server.send(500, "text/plain", "❌ Failed to load next image: " + imageUrls[currentUrlIndex]);
+    }
+  } else {
+    server.send(400, "text/plain", "❌ No URLs configured");
+  }
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Page not found");
+}
+
+// Initialize web server
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/logout", HTTP_POST, handleLogout);
+  server.on("/setWakeup", HTTP_POST, handleSetWakeup);
+  server.on("/addUrl", HTTP_POST, handleAddUrl);
+  server.on("/deleteUrl", HTTP_POST, handleDeleteUrl);
+  server.on("/displayCurrent", HTTP_POST, handleDisplayCurrent);
+  server.on("/displayImage", HTTP_POST, handleDisplayImage);
+  server.on("/nextImage", HTTP_POST, handleNextImage);
+  server.on("/changePassword", HTTP_POST, handleChangePassword);
+  server.on("/firmware", HTTP_POST, []() {
+    server.send(200, "text/plain", "");
+  }, handleFirmwareUpdate);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  Serial.println("✓ Web server started on port 80");
+  Serial.printf("✓ Access control panel at: http://%s\n", WiFi.localIP().toString().c_str());
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial.println("=== ESP32 I2C IMAGE FETCHER ===");
   
-  Serial.println("=== ULTRA-OPTIMIZED ESP32 I2C IMAGE FETCHER ===");
+  // Initialize URL storage first
+  initUrlStorage();
+  
+  // Initialize I2C communication first to check charging status
+  Serial.println("Initializing I2C for charging status check...");
+  if (!initI2C()) {
+    Serial.println("FATAL: I2C initialization failed!");
+  }
+  
+  // Wait for Pi Pico to fully initialize I2C slave
+  Serial.println("Waiting for Pi Pico I2C slave to initialize...");
+  delay(2000); // 2 second startup delay for reliable I2C communication
+  Serial.println("✓ I2C slave initialization period complete");
+  
+  // Check charging status to determine WiFi behavior
+  uint8_t charging_status = getChargingStatus();
+  current_charging_status = charging_status;
+  
+  bool should_enable_wifi = false;
+  
+  if (charging_status == 1 || charging_status == 2) {
+    // Charging or charge complete - enable WiFi services
+    Serial.println("🔌 Device is charging/charged - enabling WiFi configuration services");
+    should_enable_wifi = true;
+  } else {
+    // No external power or not charging - battery mode only
+    Serial.println("🔋 Battery mode detected - skipping WiFi to save power");
+    Serial.println("WiFi config portal and web server will be disabled to maximize battery life");
+    should_enable_wifi = false;
+  }
+  
+  // WiFi initialization based on charging status
+  if (should_enable_wifi) {
+    Serial.println("Initializing WiFi Manager (CHARGING MODE - full features enabled)...");
+    wm.setBreakAfterConfig(true);
+    wm.setConfigPortalTimeout(1800); // 30 minutes timeout for config portal when charging
+    wm.setConnectTimeout(30); // 30s connection timeout
+    wm.setConfigPortalBlocking(false);
+    wm.setSaveConfigCallback([]() {
+      Serial.println("WiFi config saved - immediate restart");
+    });
+    
+    if (!wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
+      Serial.println("WiFi connection failed after 30s - but staying in charging mode");
+      Serial.println("Configuration portal may be available for setup");
+    } else {
+      Serial.println("✓ WiFi connected successfully");
+      Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+      
+      // WiFi optimizations for charging mode
+      WiFi.setSleep(WIFI_PS_NONE); // No power saving when charging
+      WiFi.setAutoReconnect(true);
+      WiFi.persistent(true);
+      Serial.println("✓ WiFi optimizations enabled for charging mode");
+      
+      // Initialize web server for configuration
+      setupWebServer();
+    }
+  } else {
+    // Battery mode - attempt quick WiFi connection only
+    Serial.println("Attempting quick WiFi connection (BATTERY MODE - 10s timeout)...");
+    wm.setConnectTimeout(10); // Very short timeout for battery mode
+    wm.setConfigPortalTimeout(0); // Disable config portal
+    wm.setConfigPortalBlocking(false);
+    
+    if (wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
+      Serial.println("✓ Quick WiFi connection successful");
+      Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+      
+      // Minimal WiFi settings for battery mode
+      WiFi.setSleep(WIFI_PS_MAX_MODEM); // Maximum power saving
+      Serial.println("✓ WiFi connected with maximum power saving");
+    } else {
+      Serial.println("❌ Quick WiFi connection failed - entering deep sleep mode");
+      Serial.println("💤 Putting renderer to sleep and entering ESP32 deep sleep");
+      
+      // Put renderer to sleep before ESP32 sleeps
+      if (putRendererToSleep()) {
+        Serial.println("✓ Renderer sleep command sent successfully");
+      } else {
+        Serial.println("⚠ Failed to send renderer sleep command, proceeding with ESP32 sleep");
+      }
+      
+      delay(1000); // Give renderer time to process sleep command
+      
+      // Put ESP32 into deep sleep
+      Serial.println("💤 ESP32 entering deep sleep - both devices will be off");
+      Serial.flush();
+      delay(100);
+      
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      esp_deep_sleep_start(); // Sleep indefinitely until reset
+    }
+  }
+
+  Serial.println("===================");
   Serial.printf("Power efficiency mode: MAXIMUM\n");
   Serial.printf("Free heap: available\n");
   Serial.printf("Image data size: %d bytes\n", sizeof(Image7color));
@@ -649,31 +1573,6 @@ void setup() {
       }
     }
   }
-  Serial.println("===================");
-  
-  // Initialize WiFi Manager with BALANCED timeouts for reliable connection
-  Serial.println("Initializing WiFi Manager (BALANCED mode)...");
-  wm.setBreakAfterConfig(true);
-  wm.setConfigPortalTimeout(600); // 600s timeout for config portal (plenty of time to configure)
-  wm.setConnectTimeout(30); // 30s connection timeout as requested - wait longer before AP mode
-  wm.setConfigPortalBlocking(false); // Don't block if portal fails
-  wm.setSaveConfigCallback([]() {
-    Serial.println("WiFi config saved - immediate restart");
-  });
-  
-  if (!wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
-    Serial.println("WiFi connection failed after 30s - continuing with I2C only mode");
-    Serial.println("Power-efficient operation: WiFi disabled to save battery");
-  } else {
-    Serial.println("✓ WiFi connected successfully");
-    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
-    
-    // BALANCED WiFi optimizations for reliable connection with good power efficiency
-    WiFi.setSleep(WIFI_PS_NONE); // Power saving with reliable connection
-    WiFi.setAutoReconnect(true); // Enable auto-reconnect for reliable connection
-    WiFi.persistent(true); // Keep WiFi settings persistent across reboots
-    Serial.println("✓ Balanced WiFi optimizations enabled");
-  }
   
   Serial.println("=== ESP32 ULTRA-FAST I2C Master READY ===");
 }
@@ -697,12 +1596,6 @@ bool downloadAndStreamImage(const char* url) {
     if (httpCode == HTTP_CODE_OK) {
       int contentLength = http.getSize();
       Serial.printf("Content length: %d bytes\n", contentLength);
-      
-      // Limit to reasonable size for e-paper display
-      if (contentLength > 300000) { // 300KB limit
-        Serial.printf("⚠ File too large (%d bytes), limiting to 300KB\n", contentLength);
-        contentLength = 300000;
-      }
       
       WiFiClient* stream = http.getStreamPtr();
       size_t bytesRead = 0;
@@ -1234,11 +2127,68 @@ bool downloadAndConvertBmpImage(const char* url) {
 }
 
 void loop() {
+  // Handle web server requests
+  server.handleClient();
+  
   static unsigned long lastImageSend = 0;
   static bool i2cWorking = false;
   static unsigned long lastI2CTest = 0;
+  static bool powerModeChecked = false;
+  static bool isChargingMode = false;
   unsigned long currentTime = millis();
   
+  // Check charging status once at startup to determine operating mode
+  if (!powerModeChecked) {
+    uint8_t charging_status = getChargingStatus();
+    current_charging_status = charging_status;
+    
+    if (charging_status == 1 || charging_status == 2) {
+      // Charging or charge complete - web server only mode
+      isChargingMode = true;
+      Serial.println("🔌 CHARGING MODE: Power connected - running web server only (no automatic image updates)");
+      Serial.println("📱 Use the web interface to manually control image display");
+      Serial.printf("🌐 Access control panel at: http://%s\n", WiFi.localIP().toString().c_str());
+    } else {
+      // Battery mode - normal power-efficient operation
+      isChargingMode = false;
+      Serial.println("🔋 BATTERY MODE: No external power - will display image and enter deep sleep");
+    }
+    powerModeChecked = true;
+  }
+  
+  // If in charging mode, only handle web server - no automatic image processing
+  if (isChargingMode) {
+    // Just run the web server and periodic status updates
+    // Update status from Pi Pico periodically for web UI
+    static unsigned long lastStatusUpdate = 0;
+    if (currentTime - lastStatusUpdate > 30000) { // Every 30 seconds when charging
+      float new_voltage = getBatteryVoltage();
+      uint32_t new_interval = getWakeupInterval();
+      uint8_t new_charging_status = getChargingStatus();
+      
+      if (new_voltage >= 0.0f) {
+        current_battery_voltage = new_voltage;
+      }
+      if (new_interval > 0) {
+        current_wakeup_interval = new_interval;
+      }
+      current_charging_status = new_charging_status;
+      
+      lastStatusUpdate = currentTime;
+    }
+    
+    // Simple heartbeat for charging mode
+    static unsigned long lastHeartbeat = 0;
+    if (currentTime - lastHeartbeat > 300000) { // Every 5 minutes when charging
+      Serial.printf("🔌 CHARGING MODE: Web server active | Battery: %.2fV | Free heap: %u bytes\n", 
+                    current_battery_voltage, ESP.getFreeHeap());
+      lastHeartbeat = currentTime;
+    }
+    
+    return; // Exit loop - no image processing in charging mode
+  }
+  
+  // BATTERY MODE ONLY - Continue with original power-efficient behavior
   // Test I2C connection every 30 seconds if it's not working
   if (!i2cWorking && (currentTime - lastI2CTest > 30000)) {
     Serial.println("=== RETESTING I2C CONNECTION ===");
@@ -1258,22 +2208,39 @@ void loop() {
     }
   }
   
-  // Only proceed with image transfer if I2C is working
+  // BATTERY MODE ONLY - Only proceed with image transfer if I2C is working
   // SINGLE-SHOT mode: Send image once, wait for completion, then shutdown for maximum power savings
   if (i2cWorking && lastImageSend == 0) { // Only run once for battery conservation
-    Serial.println("=== SINGLE-SHOT POWER-EFFICIENT IMAGE TRANSFER ===");
+    Serial.println("🔋 BATTERY MODE: Single-shot power-efficient image transfer");
     
     // Check slave status first
     uint8_t status = getSlaveStatus();
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
     if (status == STATUS_READY || status == STATUS_ERROR) {
-      const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella.bmp";
+      // Get next URL from the cycling list
+      String imageUrl = getCurrentUrlAndAdvance();
       
-      Serial.printf("POWER-EFFICIENT converting and streaming BMP from: %s\n", imageUrl);
+      if (imageUrl.length() == 0) {
+        Serial.println("✗ No URLs configured - cannot download image");
+        Serial.println("💤 Going to deep sleep - configure URLs via web interface when charging");
+        
+        // Put renderer to sleep and then ESP32
+        if (putRendererToSleep()) {
+          Serial.println("✓ Renderer sleep command sent successfully");
+        }
+        
+        delay(1000);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        esp_deep_sleep_start();
+        return; // Should not reach here
+      }
+      
+      Serial.printf("🔋 BATTERY MODE: Converting and streaming BMP from: %s\n", imageUrl.c_str());
       bool transfer_success = false;
       
-      if (downloadAndConvertBmpImage(imageUrl)) {
+      if (downloadAndConvertBmpImage(imageUrl.c_str())) {
         Serial.println("✓ BMP conversion and streaming completed successfully");
         
         // Wait for renderer to complete the display update
@@ -1302,24 +2269,33 @@ void loop() {
         }
       }
       
-      // Shut down ESP32 after successful completion to save maximum battery power
+      // BATTERY MODE: Always go to deep sleep after image transfer (ignore web server activity)
       if (transfer_success) {
-        Serial.println("🔋 MAXIMUM POWER SAVINGS: Shutting down ESP32 after successful operation");
+        Serial.println("🔋 BATTERY MODE: Shutting down ESP32 after successful operation for maximum power savings");
         shutdownESP32(); // This function never returns
       } else {
-        Serial.println("⚠ Transfer had issues - staying awake for troubleshooting");
-        // Mark as attempted to prevent continuous retries
-        lastImageSend = currentTime;
+        Serial.println("⚠ BATTERY MODE: Transfer had issues - attempting deep sleep anyway to save battery");
+        
+        // Put renderer to sleep and then ESP32
+        if (putRendererToSleep()) {
+          Serial.println("✓ Renderer sleep command sent successfully");
+        }
+        
+        delay(1000);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        esp_deep_sleep_start();
+        return; // Should not reach here
       }
       
     } else {
-      Serial.printf("Slave not ready (status: 0x%02X) - will retry in next cycle\n", status);
+      Serial.printf("🔋 BATTERY MODE: Slave not ready (status: 0x%02X) - will retry in next cycle\n", status);
     }
   }
   
-  // Initial I2C test on first run
+  // Initial I2C test on first run (battery mode only)
   if (!i2cWorking && lastI2CTest == 0) {
-    Serial.println("=== INITIAL I2C CONNECTION TEST ===");
+    Serial.println("=== INITIAL I2C CONNECTION TEST (BATTERY MODE) ===");
     i2cWorking = testI2CConnection();
     lastI2CTest = currentTime;
   }
@@ -1334,12 +2310,12 @@ void loop() {
   // Simple heartbeat (reduced frequency for power efficiency during standby)
   static unsigned long lastHeartbeat = 0;
   if (currentTime - lastHeartbeat > 120000) { // Every 120 seconds during standby
-    Serial.printf("POWER-EFFICIENT I2C: %lu transactions, %lu errors\n", 
+    Serial.printf("🔋 BATTERY MODE: I2C: %lu transactions, %lu errors\n", 
                   i2cTransactionCount, errorCount);
     if (lastImageSend == 0) {
       Serial.println("STATUS: Waiting for I2C to become ready for single-shot transfer");
     } else {
-      Serial.println("STATUS: Single-shot transfer attempted - staying awake for troubleshooting");
+      Serial.println("STATUS: Single-shot transfer attempted");
     }
     lastHeartbeat = currentTime;
   }
