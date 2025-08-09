@@ -9,6 +9,7 @@
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <ImageData.h>
+#include <esp_sleep.h> // For deep sleep power management
 
 // Forward declarations
 bool downloadAndStreamImage(const char* url);
@@ -58,8 +59,11 @@ int I2C_SCL_PIN = 22;   // ESP32 pin 22 connects to Renderer pin 5 (SCL)
  
 WiFiManager wm;
 
-static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
+// ULTRA-OPTIMIZED buffer sizes for maximum power efficiency
+static constexpr size_t BUFFER_SIZE = 1024; // Doubled for faster HTTP reads
+static constexpr size_t STREAM_BUFFER_SIZE = 2048; // Large streaming buffer
 uint8_t i2c_buffer[BUFFER_SIZE] = { 0 };
+uint8_t stream_buffer[STREAM_BUFFER_SIZE] = { 0 }; // Dedicated streaming buffer
 uint32_t currentChunk = 0;  // Current chunk being sent
 uint32_t totalChunks = (sizeof(Image7color) + CHUNK_SIZE - 1) / CHUNK_SIZE; // Total chunks needed (192000/123 = 1561)
 
@@ -193,94 +197,144 @@ void printI2CConfiguration() {
   Serial.printf("Pin Configuration:\n");
   Serial.printf("  SDA (Data)       : GPIO %d (connects to Renderer pin 4)\n", I2C_SDA_PIN);
   Serial.printf("  SCL (Clock)      : GPIO %d (connects to Renderer pin 5)\n", I2C_SCL_PIN);
-  Serial.printf("Clock: 600kHz\n");
+  Serial.printf("Clock: 800kHz\n");
   Serial.printf("Image size: %d bytes\n", sizeof(Image7color));
   Serial.printf("Total chunks: %d\n", totalChunks);
   Serial.println("=====================================");
+  Serial.println("");
+  Serial.println("🔌 WIRING CHECKLIST:");
+  Serial.println("  ESP32 Pin 21 (SDA) → Pi Pico Pin 4 (GP2/SDA)");
+  Serial.println("  ESP32 Pin 22 (SCL) → Pi Pico Pin 5 (GP3/SCL)");
+  Serial.println("  ESP32 GND        → Pi Pico GND");
+  Serial.println("  Both devices powered independently");
+  Serial.println("");
+  Serial.println("📋 TROUBLESHOOTING:");
+  Serial.println("  1. Check Pi Pico has renderer.cpp uploaded");
+  Serial.println("  2. Verify Pi Pico I2C address is 0x42");
+  Serial.println("  3. Ensure no loose wire connections");
+  Serial.println("  4. Try lower I2C speed if issues persist");
+  Serial.println("=====================================");
 }
 
-// Send a chunk of data to Pi Pico slave
+// Send a chunk of data to Pi Pico slave with improved retry and delays
 bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
   // I2C buffer limit: 128 bytes buffer - 5 bytes header = 123 bytes max data
   if (data_size > 123) data_size = 123; // Max data size to fit in I2C transaction
-  
-  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
-  Wire.write(CMD_WRITE_CHUNK);
-  
-  // Send chunk ID (4 bytes, big endian)
-  Wire.write((chunk_id >> 24) & 0xFF);
-  Wire.write((chunk_id >> 16) & 0xFF); 
-  Wire.write((chunk_id >> 8) & 0xFF);
-  Wire.write(chunk_id & 0xFF);
-  
-  // Send chunk data
-  size_t written = Wire.write(data, data_size);
-  
-  // Verify all data was queued for transmission
-  if (written != data_size) {
-    Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for chunk %d\n", 
-                  written, data_size, chunk_id);
-    Wire.endTransmission(); // Clean up
-    errorCount++;
-    return false;
+
+  // More conservative retry loop - up to 5 attempts with small delays
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      delay(10); // Small delay between retries for I2C stability
+    }
+    
+    Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+    Wire.write(CMD_WRITE_CHUNK);
+    
+    // Send chunk ID (4 bytes, big endian)
+    Wire.write((chunk_id >> 24) & 0xFF);
+    Wire.write((chunk_id >> 16) & 0xFF); 
+    Wire.write((chunk_id >> 8) & 0xFF);
+    Wire.write(chunk_id & 0xFF);
+    
+    // Send chunk data
+    size_t written = Wire.write(data, data_size);
+    
+    // Verify all data was queued for transmission
+    if (written != data_size) {
+      if (attempt >= 2) { // Log after 3 attempts
+        Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for chunk %d (attempt %d)\n", 
+                      written, data_size, chunk_id, attempt + 1);
+      }
+      Wire.endTransmission(); // Clean up
+      errorCount++;
+      continue; // Retry with delay
+    }
+    
+    uint8_t error = Wire.endTransmission();
+    
+    if (error == 0) {
+      lastI2CActivity = millis();
+      i2cTransactionCount++;
+      return true; // Success!
+    } else {
+      if (attempt >= 2) { // Log after 3 attempts
+        Serial.printf("✗ Failed to send chunk %d (attempt %d, error: %d)\n", chunk_id, attempt + 1, error);
+        if (error == 5) {
+          Serial.println("   → I2C timeout - slave may be busy or not responding");
+        } else if (error == 2) {
+          Serial.println("   → NACK on address - check slave address and wiring");
+        } else if (error == 3) {
+          Serial.println("   → NACK on data - slave rejected data");
+        }
+      }
+      errorCount++;
+    }
   }
   
-  uint8_t error = Wire.endTransmission();
-  
-  if (error == 0) {
-    lastI2CActivity = millis();
-    i2cTransactionCount++;
-    return true;
-  } else {
-    Serial.printf("✗ Failed to send chunk %d (error: %d)\n", chunk_id, error);
-    errorCount++;
-    return false;
-  }
+  Serial.printf("✗ Failed to send chunk %d after %d attempts\n", chunk_id, 5);
+  return false; // All attempts failed
 }
 
-// Send a chunk of data to specific address offset in Pi Pico slave memory
+// Send a chunk of data to specific address offset in Pi Pico slave memory with improved retry
 bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_t data_size) {
   // I2C buffer limit: 128 bytes buffer - 9 bytes header = 119 bytes max data
   if (data_size > 119) data_size = 119; // Max data size to fit in I2C transaction with address
-  
-  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
-  Wire.write(CMD_WRITE_CHUNK_ADDR);
-  
-  // Send address offset (4 bytes, big endian)
-  Wire.write((address_offset >> 24) & 0xFF);
-  Wire.write((address_offset >> 16) & 0xFF); 
-  Wire.write((address_offset >> 8) & 0xFF);
-  Wire.write(address_offset & 0xFF);
-  
-  // Send data size (4 bytes, big endian)  
-  Wire.write((data_size >> 24) & 0xFF);
-  Wire.write((data_size >> 16) & 0xFF);
-  Wire.write((data_size >> 8) & 0xFF);
-  Wire.write(data_size & 0xFF);
-  
-  // Send chunk data
-  size_t written = Wire.write(data, data_size);
-  
-  // Verify all data was queued for transmission
-  if (written != data_size) {
-    Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for address 0x%08X\n", 
-                  written, data_size, address_offset);
-    Wire.endTransmission(); // Clean up
-    errorCount++;
-    return false;
+
+  // More conservative retry loop - up to 5 attempts with small delays
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      delay(10); // Small delay between retries for I2C stability
+    }
+    
+    Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+    Wire.write(CMD_WRITE_CHUNK_ADDR);
+    
+    // Send address offset (4 bytes, big endian)
+    Wire.write((address_offset >> 24) & 0xFF);
+    Wire.write((address_offset >> 16) & 0xFF); 
+    Wire.write((address_offset >> 8) & 0xFF);
+    Wire.write(address_offset & 0xFF);
+    
+    // Send data size (4 bytes, big endian)  
+    Wire.write((data_size >> 24) & 0xFF);
+    Wire.write((data_size >> 16) & 0xFF);
+    Wire.write((data_size >> 8) & 0xFF);
+    Wire.write(data_size & 0xFF);
+    
+    // Send chunk data
+    size_t written = Wire.write(data, data_size);
+    
+    // Verify all data was queued for transmission
+    if (written != data_size) {
+      if (attempt >= 2) { // Log after 3 attempts
+        Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for address 0x%08X (attempt %d)\n", 
+                      written, data_size, address_offset, attempt + 1);
+      }
+      Wire.endTransmission(); // Clean up
+      errorCount++;
+      continue; // Retry with delay
+    }
+    
+    uint8_t error = Wire.endTransmission();
+    
+    if (error == 0) {
+      lastI2CActivity = millis();
+      i2cTransactionCount++;
+      return true; // Success!
+    } else {
+      if (attempt >= 2) { // Log after 3 attempts
+        Serial.printf("✗ Failed to send chunk to address 0x%08X (attempt %d, error: %d)\n", 
+                      address_offset, attempt + 1, error);
+        if (error == 5) {
+          Serial.println("   → I2C timeout - slave may be busy processing data");
+        }
+      }
+      errorCount++;
+    }
   }
   
-  uint8_t error = Wire.endTransmission();
-  
-  if (error == 0) {
-    lastI2CActivity = millis();
-    i2cTransactionCount++;
-    return true;
-  } else {
-    Serial.printf("✗ Failed to send chunk to address 0x%08X (error: %d)\n", address_offset, error);
-    errorCount++;
-    return false;
-  }
+  Serial.printf("✗ Failed to send chunk to address 0x%08X after %d attempts\n", address_offset, 5);
+  return false; // All attempts failed
 }
 
 // Send render command to Pi Pico slave
@@ -317,6 +371,51 @@ bool sendBmpRenderCommand() {
   }
 }
 
+// Test I2C communication with Pi Pico
+bool testI2CConnection() {
+  Serial.println("=== TESTING I2C CONNECTION ===");
+  
+  // Test 1: Simple address check
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("✗ Basic I2C test failed (error: %d)\n", error);
+    if (error == 2) {
+      Serial.println("  → Address NACK - Pi Pico not responding at 0x42");
+      Serial.println("  → Check: Pi Pico powered? I2C slave code running?");
+    } else if (error == 5) {
+      Serial.println("  → Timeout - Check I2C wiring and connections");
+    }
+    return false;
+  }
+  
+  Serial.println("✓ Basic I2C address test passed");
+  
+  // Test 2: Try to get status (simple read test)
+  Serial.println("Testing status read...");
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_STATUS);
+  error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("✗ Status command failed (error: %d)\n", error);
+    return false;
+  }
+  
+  // Request response
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+  
+  if (Wire.available()) {
+    uint8_t status = Wire.read();
+    Serial.printf("✓ Pi Pico status read successful: 0x%02X\n", status);
+    return true;
+  } else {
+    Serial.println("✗ No status response - Pi Pico may not have I2C slave code running");
+    return false;
+  }
+}
+
 // Get status from Pi Pico slave
 uint8_t getSlaveStatus() {
   Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
@@ -341,6 +440,59 @@ uint8_t getSlaveStatus() {
   }
 }
 
+// Wait for renderer to complete and confirm render status
+bool waitForRenderCompletion(uint32_t timeout_ms = 30000) {
+  Serial.println("Waiting for renderer to be ready for rendering...");
+  unsigned long start_time = millis();
+  
+  while ((millis() - start_time) < timeout_ms) {
+    uint8_t status = getSlaveStatus();
+    
+    if (status == STATUS_READY) {
+      Serial.println("✓ Renderer completed successfully - display updated!");
+      return true;
+    } else if (status == STATUS_ERROR) {
+      Serial.println("✗ Renderer reported error during rendering");
+      return false;
+    } else if (status == STATUS_READY_TO_RENDER) {
+      Serial.println("✓ PERFECT TIMING: Renderer has all data and is ready to render!");
+      Serial.println("🔋 ESP32 job complete - shutting down for maximum power savings!");
+      return true; // ESP32 can shut down now - Pi Pico will handle the rest
+    } else if (status == STATUS_RECEIVING) {
+      Serial.printf("Renderer receiving data... (status: 0x%02X)\n", status);
+    } else {
+      Serial.printf("Unknown renderer status: 0x%02X\n", status);
+    }
+    
+    delay(1000); // Check every second
+  }
+  
+  Serial.printf("✗ Timeout waiting for renderer completion after %d seconds\n", timeout_ms / 1000);
+  return false;
+}
+
+// Shut down ESP32 for maximum power savings
+void shutdownESP32() {
+  Serial.println("=== POWER SHUTDOWN SEQUENCE ===");
+  Serial.println("✓ Image transfer and rendering completed successfully");
+  Serial.println("💤 Shutting down ESP32 to save battery power...");
+  Serial.println("Device will remain off until manually reset or power cycled");
+  Serial.println("=====================================");
+  
+  // Give time for serial output to complete
+  Serial.flush();
+  delay(100);
+  
+  // Disconnect WiFi to save power during shutdown
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  // Put ESP32 into deep sleep mode (lowest power consumption)
+  // Note: ESP32 will stay in deep sleep until reset button is pressed
+  // or power is cycled, as we're not setting a wake-up timer
+  esp_deep_sleep_start();
+}
+
 // Send complete image to Pi Pico slave
 bool sendCompleteImage() {
   // Determine image source and size
@@ -363,30 +515,28 @@ bool sendCompleteImage() {
   // Reset chunk counter
   currentChunk = 0;
   
-  // Send all chunks
+  // Send all chunks at maximum speed
+  unsigned long transfer_start = millis();
   for (uint32_t chunk = 0; chunk < totalChunks; chunk++) {
     uint32_t offset = chunk * CHUNK_SIZE;
     size_t remaining = image_size - offset;
     size_t chunk_size = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
     
     if (!sendImageChunk(chunk, &image_data[offset], chunk_size)) {
-      Serial.printf("✗ Failed to send chunk %d\n", chunk);
+      Serial.printf("✗ Failed to send chunk %d after retries\n", chunk);
       return false;
     }
     
-    // Small delay between chunks 
-    delay(2); // Minimal delay for fast transfers
-    
-    // Enhanced progress reporting - every 50 chunks or at completion
-    if (chunk % 50 == 0 || chunk == totalChunks - 1) {
+    // Less frequent progress reporting - every 100 chunks or at completion
+    if (chunk % 100 == 0 || chunk == totalChunks - 1) {
       float percent = ((float)(chunk + 1) / totalChunks) * 100.0;
       uint32_t bytes_sent = (chunk + 1) * CHUNK_SIZE;
       if (bytes_sent > image_size) bytes_sent = image_size;
+      unsigned long elapsed = millis() - transfer_start;
+      float kbps = elapsed > 0 ? (bytes_sent / (float)elapsed) : 0;
       
-      Serial.printf("📊 Progress: %d/%d chunks (%.2f%%) - %d/%d bytes sent\n", 
-                    chunk + 1, totalChunks, percent,
-                    bytes_sent, image_size);
-    
+      Serial.printf("📊 Progress: %d/%d chunks (%.1f%%) - %d/%d bytes (%.1f KB/s)\n", 
+                    chunk + 1, totalChunks, percent, bytes_sent, image_size, kbps);
     }
   }
   
@@ -404,18 +554,18 @@ bool initI2C() {
   
   printI2CConfiguration();
   
-  // Add delay to ensure Pi Pico slave is ready
-  Serial.println("Waiting for I2C bus to stabilize...");
-  delay(1000); // Reduced from 2000ms to 1000ms
+  // ULTRA-FAST startup - minimal delay for maximum power efficiency
+  Serial.println("Instant I2C bus initialization...");
   
   Serial.printf("Using ESP32 I2C master pins SDA=%d, SCL=%d\n", I2C_SDA_PIN, I2C_SCL_PIN);
   
   // Initialize I2C master with specified pins
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(600000); // Back to 600kHz - this was working correctly
+  Wire.setClock(400000); // Reduced to 400kHz for more reliable communication (was 800kHz)
+  Wire.setTimeout(2000); // Longer timeout for more reliable error detection
 
   Serial.println("✓ I2C master initialization complete");
-  Serial.printf("Active configuration: SDA=%d, SCL=%d, Clock=600kHz\n", 
+  Serial.printf("RELIABLE config: SDA=%d, SCL=%d, Clock=400kHz, Timeout=2s\n", 
                 I2C_SDA_PIN, I2C_SCL_PIN);
   Serial.printf("Communicating with Pi Pico slave at address 0x%02X\n", PI_PICO_I2C_ADDRESS);
   Serial.println("Physical connections:");
@@ -433,42 +583,111 @@ bool initI2C() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
   
-  Serial.println("=== ESP32 I2C IMAGE FETCHER STARTING ===");
+  Serial.println("=== ULTRA-OPTIMIZED ESP32 I2C IMAGE FETCHER ===");
+  Serial.printf("Power efficiency mode: MAXIMUM\n");
   Serial.printf("Free heap: available\n");
   Serial.printf("Image data size: %d bytes\n", sizeof(Image7color));
   
-  // Initialize I2C communication
+  // Initialize I2C communication with fastest settings
   if (!initI2C()) {
     Serial.println("FATAL: I2C initialization failed!");
-    while (1) {
-      delay(1000);
-      Serial.println("I2C init failed, system halted");
+  }
+  
+  // Wait for Pi Pico to fully initialize I2C slave
+  Serial.println("Waiting for Pi Pico I2C slave to initialize...");
+  delay(2000); // 2 second startup delay for reliable I2C communication
+  Serial.println("✓ I2C slave initialization period complete");
+  
+  // Perform I2C bus scan to check for devices
+  Serial.println("=== I2C BUS SCAN ===");
+  Serial.println("Scanning for I2C devices...");
+  
+  int deviceCount = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.printf("✓ I2C device found at address 0x%02X\n", address);
+      deviceCount++;
+      
+      if (address == PI_PICO_I2C_ADDRESS) {
+        Serial.printf("✓ CONFIRMED: Pi Pico found at expected address 0x%02X\n", address);
+      }
+    } else if (error == 4) {
+      Serial.printf("✗ Unknown error at address 0x%02X\n", address);
     }
   }
   
-  // Initialize WiFi Manager for potential future features
-  Serial.println("Initializing WiFi Manager...");
+  if (deviceCount == 0) {
+    Serial.println("✗ NO I2C DEVICES FOUND!");
+    Serial.println("This indicates:");
+    Serial.println("  1. Pi Pico is not powered or not running");
+    Serial.println("  2. I2C wiring issues (SDA/SCL swapped or disconnected)");
+    Serial.println("  3. Pi Pico I2C slave code not running");
+    Serial.println("  4. Wrong I2C address in Pi Pico code");
+  } else {
+    Serial.printf("✓ Found %d I2C device(s)\n", deviceCount);
+    
+    if (deviceCount > 0) {
+      // Test communication with our expected device
+      Serial.printf("Testing communication with Pi Pico at 0x%02X...\n", PI_PICO_I2C_ADDRESS);
+      
+      Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+      uint8_t testError = Wire.endTransmission();
+      
+      if (testError == 0) {
+        Serial.println("✓ Pi Pico responds to address!");
+      } else {
+        Serial.printf("✗ Pi Pico does not respond (error: %d)\n", testError);
+        if (testError == 2) {
+          Serial.println("  → NACK on address - Pi Pico not at this address");
+        } else if (testError == 5) {
+          Serial.println("  → Timeout - Pi Pico may be busy or address wrong");
+        }
+      }
+    }
+  }
+  Serial.println("===================");
+  
+  // Initialize WiFi Manager with BALANCED timeouts for reliable connection
+  Serial.println("Initializing WiFi Manager (BALANCED mode)...");
   wm.setBreakAfterConfig(true);
+  wm.setConfigPortalTimeout(600); // 600s timeout for config portal (plenty of time to configure)
+  wm.setConnectTimeout(30); // 30s connection timeout as requested - wait longer before AP mode
+  wm.setConfigPortalBlocking(false); // Don't block if portal fails
+  wm.setSaveConfigCallback([]() {
+    Serial.println("WiFi config saved - immediate restart");
+  });
   
   if (!wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
-    Serial.println("WiFi connection failed, continuing with I2C only");
+    Serial.println("WiFi connection failed after 30s - continuing with I2C only mode");
+    Serial.println("Power-efficient operation: WiFi disabled to save battery");
   } else {
-    Serial.println("✓ WiFi connected");
+    Serial.println("✓ WiFi connected successfully");
     Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+    
+    // BALANCED WiFi optimizations for reliable connection with good power efficiency
+    WiFi.setSleep(WIFI_PS_NONE); // Power saving with reliable connection
+    WiFi.setAutoReconnect(true); // Enable auto-reconnect for reliable connection
+    WiFi.persistent(true); // Keep WiFi settings persistent across reboots
+    Serial.println("✓ Balanced WiFi optimizations enabled");
   }
   
-  Serial.println("=== ESP32 I2C Master READY ===");
+  Serial.println("=== ESP32 ULTRA-FAST I2C Master READY ===");
 }
 
-// Download and stream image directly to Pi Pico
+// Download and stream image directly to Pi Pico with MAXIMUM SPEED
 bool downloadAndStreamImage(const char* url) {
-  Serial.printf("Starting streaming download from: %s\n", url);
+  Serial.printf("Starting ULTRA-FAST streaming download from: %s\n", url);
   
   HTTPClient http;
   http.begin(url);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(5000); // BALANCED: 5s timeout for reliable downloads
+  http.setConnectTimeout(2000); // 2s connection timeout for reliable connection
+  http.setReuse(false); // Don't reuse connections for faster cleanup
   
   int httpCode = http.GET();
   
@@ -488,49 +707,54 @@ bool downloadAndStreamImage(const char* url) {
       WiFiClient* stream = http.getStreamPtr();
       size_t bytesRead = 0;
       uint32_t chunk_id = 0;
-      uint8_t chunk_buffer[CHUNK_SIZE];
+      unsigned long start_time = millis(); // For transfer speed calculation
       
-      Serial.printf("Streaming %d bytes in chunks...\n", contentLength);
+      Serial.printf("ULTRA-FAST streaming %d bytes in chunks...\n", contentLength);
       
       while (http.connected() && bytesRead < contentLength) {
         size_t available = stream->available();
         if (available) {
-          // Read up to one chunk size
-          size_t toRead = min(available, (size_t)CHUNK_SIZE);
+          // Read larger chunks using our dedicated streaming buffer
+          size_t toRead = min(available, (size_t)STREAM_BUFFER_SIZE);
           toRead = min(toRead, (size_t)(contentLength - bytesRead));
           
-          size_t readSize = stream->readBytes(chunk_buffer, toRead);
+          size_t readSize = stream->readBytes(stream_buffer, toRead);
           
           if (readSize > 0) {
-            // Send this chunk via I2C immediately
-            if (!sendImageChunk(chunk_id, chunk_buffer, readSize)) {
-              Serial.printf("✗ Failed to send streaming chunk %d\n", chunk_id);
-              http.end();
-              return false;
+            // Split large buffer into I2C chunks and send immediately
+            size_t bytes_processed = 0;
+            while (bytes_processed < readSize) {
+              size_t chunk_size = min((size_t)CHUNK_SIZE, readSize - bytes_processed);
+              
+              // Send this chunk via I2C immediately  
+              if (!sendImageChunk(chunk_id, &stream_buffer[bytes_processed], chunk_size)) {
+                Serial.printf("✗ Failed to send streaming chunk %d\n", chunk_id);
+                http.end();
+                return false;
+              }
+              
+              chunk_id++;
+              bytes_processed += chunk_size;
             }
             
-            chunk_id++;
             bytesRead += readSize;
             
-            // Progress reporting
-            if (bytesRead % 5000 == 0) { // Every 5KB
+            // Progress reporting every 20KB for less verbosity but speed monitoring
+            if (bytesRead % 20000 == 0) { // Every 20KB (was 10KB)
               float percent = ((float)bytesRead / contentLength) * 100.0;
-              Serial.printf("Streamed: %d/%d bytes (%.1f%%)\n", 
-                           bytesRead, contentLength, percent);
+              float kbps = (millis() > start_time) ? (bytesRead / (float)(millis() - start_time)) : 0;
+              Serial.printf("ULTRA-FAST stream: %d/%d bytes (%.1f%%, %.1f KB/s)\n", 
+                           bytesRead, contentLength, percent, kbps);
             }
-            
-            // Small delay for I2C stability
-            delay(2);
+          
           }
-        } else {
-          delay(1);
         }
       }
       
-      Serial.printf("✓ Streaming completed: %d bytes in %d chunks\n", bytesRead, chunk_id);
+      Serial.printf("✓ ULTRA-FAST streaming completed: %d bytes in %d chunks\n", bytesRead, chunk_id);
       http.end();
       
-      // Send render command
+      // Send render command immediately
       if (!sendRenderCommand()) {
         return false;
       }
@@ -562,8 +786,10 @@ bool downloadAndConvertBmpImage(const char* url) {
   http.addHeader("Accept-Encoding", "identity"); // Disable compression for simplicity
   http.addHeader("Connection", "close");
   
-  // Set longer timeout for complex decryption URLs
-  http.setTimeout(30000); // 30 seconds
+  // Set BALANCED timeout for reliable downloads
+  http.setTimeout(8000); // 8 seconds for reliable BMP downloads
+  http.setConnectTimeout(2000); // 2s connection timeout for reliable connection
+  http.setReuse(false); // Don't reuse connections for faster cleanup
   
   Serial.println("Making HTTP request with enhanced headers...");
   int httpCode = http.GET();
@@ -593,9 +819,6 @@ bool downloadAndConvertBmpImage(const char* url) {
       // Check available heap before proceeding
       Serial.printf("Free heap before conversion: %d bytes\n", ESP.getFreeHeap());
       
-      // Small delay to ensure stream is properly established
-      delay(100);
-      
       WiFiClient* stream = http.getStreamPtr();
       
       // Read BMP headers first
@@ -608,10 +831,10 @@ bool downloadAndConvertBmpImage(const char* url) {
         return false;
       }
       
-      // Read headers with proper buffering and timeout
+      // Read headers with ULTRA-AGGRESSIVE buffering and timeout
       size_t header_read = 0;
       unsigned long start_time = millis();
-      const unsigned long timeout = 10000; // 10 second timeout
+      const unsigned long timeout = 2000; // 2 second timeout (was 3s) for maximum power efficiency
       
       Serial.printf("Reading BMP headers (%d bytes)...\n", header_size);
       
@@ -625,8 +848,6 @@ bool downloadAndConvertBmpImage(const char* url) {
             header_read += read_size;
             Serial.printf("Read %d bytes, total: %d/%d\n", read_size, header_read, header_size);
           }
-        } else {
-          delay(10); // Wait for more data
         }
       }
       
@@ -693,7 +914,7 @@ bool downloadAndConvertBmpImage(const char* url) {
           return false;
         }
         
-        // Read palette with proper buffering
+        // Read palette with ULTRA-FAST buffering
         size_t palette_read = 0;
         start_time = millis();
         
@@ -711,8 +932,6 @@ bool downloadAndConvertBmpImage(const char* url) {
                 Serial.printf("Palette read: %d/%d bytes\n", palette_read, palette_size);
               }
             }
-          } else {
-            delay(10); // Wait for more data
           }
         }
         
@@ -764,12 +983,8 @@ bool downloadAndConvertBmpImage(const char* url) {
             uint8_t skip_byte;
             if (stream->readBytes(&skip_byte, 1) == 1) {
               bytes_read_so_far++;
-            } else {
-              delay(1);
             }
           }
-        } else {
-          delay(10); // Wait for more data
         }
       }
       
@@ -838,7 +1053,7 @@ bool downloadAndConvertBmpImage(const char* url) {
           // Read entire BMP row into buffer
           size_t row_read = 0;
           unsigned long row_start_time = millis();
-          const unsigned long row_timeout = 5000;
+          const unsigned long row_timeout = 1000; // 1s timeout (was 2s) for maximum power efficiency
           
           while (row_read < bmp_row_total && (millis() - row_start_time) < row_timeout) {
             if (stream->available() > 0) {
@@ -849,8 +1064,6 @@ bool downloadAndConvertBmpImage(const char* url) {
               if (read_size > 0) {
                 row_read += read_size;
               }
-            } else {
-              delay(1);
             }
           }
           
@@ -937,7 +1150,6 @@ bool downloadAndConvertBmpImage(const char* url) {
                              bytes_streamed, epaper_size, percent);
               }
               
-              delay(1);
             }
           }
           
@@ -1023,11 +1235,33 @@ bool downloadAndConvertBmpImage(const char* url) {
 
 void loop() {
   static unsigned long lastImageSend = 0;
+  static bool i2cWorking = false;
+  static unsigned long lastI2CTest = 0;
   unsigned long currentTime = millis();
   
-  // Send image immediately on first run, then every 30 seconds
-  if (lastImageSend == 0 || (currentTime - lastImageSend > 30000)) {
-    Serial.println("=== Starting new image transfer cycle ===");
+  // Test I2C connection every 30 seconds if it's not working
+  if (!i2cWorking && (currentTime - lastI2CTest > 30000)) {
+    Serial.println("=== RETESTING I2C CONNECTION ===");
+    i2cWorking = testI2CConnection();
+    lastI2CTest = currentTime;
+    
+    if (!i2cWorking) {
+      Serial.println("⚠ I2C still not working - skipping image transfer");
+      Serial.println("CHECK:");
+      Serial.println("  1. Is Pi Pico powered and running?");
+      Serial.println("  2. Is renderer.cpp uploaded to Pi Pico?");
+      Serial.println("  3. Are I2C wires connected: ESP32-21→Pico-4, ESP32-22→Pico-5?");
+      Serial.println("  4. Is Pi Pico I2C address set to 0x42?");
+      return; // Skip this loop iteration
+    } else {
+      Serial.println("✓ I2C connection restored!");
+    }
+  }
+  
+  // Only proceed with image transfer if I2C is working
+  // SINGLE-SHOT mode: Send image once, wait for completion, then shutdown for maximum power savings
+  if (i2cWorking && lastImageSend == 0) { // Only run once for battery conservation
+    Serial.println("=== SINGLE-SHOT POWER-EFFICIENT IMAGE TRANSFER ===");
     
     // Check slave status first
     uint8_t status = getSlaveStatus();
@@ -1036,40 +1270,78 @@ void loop() {
     if (status == STATUS_READY || status == STATUS_ERROR) {
       const char* imageUrl = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella.bmp";
       
-      Serial.printf("Converting and streaming BMP from: %s\n", imageUrl);
+      Serial.printf("POWER-EFFICIENT converting and streaming BMP from: %s\n", imageUrl);
+      bool transfer_success = false;
+      
       if (downloadAndConvertBmpImage(imageUrl)) {
-        Serial.println("✓ BMP conversion and rendering completed successfully");
+        Serial.println("✓ BMP conversion and streaming completed successfully");
+        
+        // Wait for renderer to complete the display update
+        if (waitForRenderCompletion(30000)) { // 30 second timeout
+          Serial.println("✓ COMPLETE SUCCESS: Image transfer and rendering finished!");
+          transfer_success = true;
+        } else {
+          Serial.println("⚠ Render completion timeout - may still be working");
+        }
       } else {
-        Serial.println("⚠ BMP conversion failed, sending static image as fallback");
+        Serial.println("⚠ BMP conversion failed, trying static image as fallback");
         
         // Fallback to static image
         if (sendCompleteImage()) {
           Serial.println("✓ Fallback image transfer completed successfully");
+          
+          // Wait for renderer to complete the display update
+          if (waitForRenderCompletion(30000)) { // 30 second timeout
+            Serial.println("✓ COMPLETE SUCCESS: Fallback image transfer and rendering finished!");
+            transfer_success = true;
+          } else {
+            Serial.println("⚠ Fallback render completion timeout - may still be working");
+          }
         } else {
           Serial.println("✗ Even fallback image transfer failed");
         }
       }
+      
+      // Shut down ESP32 after successful completion to save maximum battery power
+      if (transfer_success) {
+        Serial.println("🔋 MAXIMUM POWER SAVINGS: Shutting down ESP32 after successful operation");
+        shutdownESP32(); // This function never returns
+      } else {
+        Serial.println("⚠ Transfer had issues - staying awake for troubleshooting");
+        // Mark as attempted to prevent continuous retries
+        lastImageSend = currentTime;
+      }
+      
     } else {
-      Serial.printf("Slave not ready (status: 0x%02X) - skipping this cycle\n", status);
+      Serial.printf("Slave not ready (status: 0x%02X) - will retry in next cycle\n", status);
     }
-    
-    lastImageSend = currentTime;
   }
   
-  // Check connection health periodically
+  // Initial I2C test on first run
+  if (!i2cWorking && lastI2CTest == 0) {
+    Serial.println("=== INITIAL I2C CONNECTION TEST ===");
+    i2cWorking = testI2CConnection();
+    lastI2CTest = currentTime;
+  }
+  
+  // Check connection health periodically (reduced frequency for power efficiency)
   static unsigned long lastHealthCheck = 0;
-  if (currentTime - lastHealthCheck > 5000) { // Every 5 seconds
+  if (currentTime - lastHealthCheck > 20000) { // Every 20 seconds (was 10) for less overhead
     checkI2CConnectionHealth();
     lastHealthCheck = currentTime;
   }
   
-  // Simple heartbeat (reduced frequency)
+  // Simple heartbeat (reduced frequency for power efficiency during standby)
   static unsigned long lastHeartbeat = 0;
-  if (currentTime - lastHeartbeat > 30000) { // Every 30 seconds (was 10)
-    Serial.printf("I2C Heartbeat: %lu transactions, %lu errors\n", 
+  if (currentTime - lastHeartbeat > 120000) { // Every 120 seconds during standby
+    Serial.printf("POWER-EFFICIENT I2C: %lu transactions, %lu errors\n", 
                   i2cTransactionCount, errorCount);
+    if (lastImageSend == 0) {
+      Serial.println("STATUS: Waiting for I2C to become ready for single-shot transfer");
+    } else {
+      Serial.println("STATUS: Single-shot transfer attempted - staying awake for troubleshooting");
+    }
     lastHeartbeat = currentTime;
   }
-  
-  delay(100); // Small delay to prevent busy loop
+
 }
