@@ -17,8 +17,13 @@
 // Forward declarations
 bool downloadAndStreamImage(const char* url);
 bool downloadAndConvertBmpImage(const char* url);
-void initUrlStorage();
+bool sendBatteryInfoToDisplay(float voltage, uint32_t cycles);
+int calculateBatteryPercentage(float voltage);
 void saveUrls();
+void saveAdminSettings();
+void initUrlStorage();
+void initBatteryData();
+void saveBatteryData();
 String getCurrentUrlAndAdvance();
 bool addUrl(const String& url);
 bool removeUrl(int index);
@@ -91,11 +96,15 @@ int currentUrlIndex = 0;         // Index of current URL being used
 float current_battery_voltage = 0.0f;
 uint32_t current_wakeup_interval = 30;
 uint8_t current_charging_status = 3; // 0=not charging, 1=charging, 2=charge complete, 3=no external power
+uint32_t display_cycle_count = 0; // Track number of display updates for battery info
 unsigned long last_status_update = 0;
 
-// ULTRA-OPTIMIZED buffer sizes for maximum power efficiency
-static constexpr size_t BUFFER_SIZE = 1024; // Doubled for faster HTTP reads
-static constexpr size_t STREAM_BUFFER_SIZE = 2048; // Large streaming buffer
+// Flash wear leveling for URL storage
+uint32_t write_cycle_counter = 0; // Track total write cycles for wear distribution
+
+// buffer sizes for maximum power efficiency
+static constexpr size_t BUFFER_SIZE = 8192; // Doubled for faster HTTP reads
+static constexpr size_t STREAM_BUFFER_SIZE = 16384; // Large streaming buffer
 uint8_t i2c_buffer[BUFFER_SIZE] = { 0 };
 uint8_t stream_buffer[STREAM_BUFFER_SIZE] = { 0 }; // Dedicated streaming buffer
 uint32_t currentChunk = 0;  // Current chunk being sent
@@ -112,6 +121,7 @@ uint32_t totalChunks = (sizeof(Image7color) + CHUNK_SIZE - 1) / CHUNK_SIZE; // T
 #define CMD_SET_WAKEUP        0x08  // Set RTC wakeup interval in minutes
 #define CMD_GET_CHARGING      0x09  // Get charging status (0=not charging, 1=charging, 2=charge complete)
 #define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
+#define CMD_SET_BATTERY_INFO  0x0B  // Set battery info for overlay display (voltage, cycles)
 
 // Status response codes from slave
 #define STATUS_READY          0x00  // Ready for next image
@@ -392,6 +402,9 @@ bool sendRenderCommand() {
   if (error == 0) {
     Serial.println("✓ Render command sent");
     lastI2CActivity = millis();
+    display_cycle_count++; // Increment display cycle counter
+    Serial.printf("Display cycle count: %d\n", display_cycle_count);
+    saveBatteryData(); // Save updated cycle count
     return true;
   } else {
     Serial.printf("✗ Failed to send render command (error: %d)\n", error);
@@ -409,6 +422,9 @@ bool sendBmpRenderCommand() {
   if (error == 0) {
     Serial.println("✓ BMP reorder and render command sent");
     lastI2CActivity = millis();
+    display_cycle_count++; // Increment display cycle counter  
+    Serial.printf("Display cycle count: %d\n", display_cycle_count);
+    saveBatteryData(); // Save updated cycle count
     return true;
   } else {
     Serial.printf("✗ Failed to send BMP render command (error: %d)\n", error);
@@ -599,8 +615,7 @@ bool initI2C() {
   Serial.println("Initializing I2C master communication...");
   
   printI2CConfiguration();
-  
-  // ULTRA-FAST startup - minimal delay for maximum power efficiency
+
   Serial.println("Instant I2C bus initialization...");
   
   Serial.printf("Using ESP32 I2C master pins SDA=%d, SCL=%d\n", I2C_SDA_PIN, I2C_SCL_PIN);
@@ -627,33 +642,106 @@ bool initI2C() {
   return true;
 }
 
-// Get battery voltage from Pi Pico
+// Get battery voltage from Pi Pico with retry logic
 float getBatteryVoltage() {
   Serial.println("Requesting battery voltage from Pi Pico...");
   
-  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
-  Wire.write(CMD_GET_BATTERY);
-  uint8_t error = Wire.endTransmission();
-  
-  if (error != 0) {
-    Serial.printf("Failed to send battery command, error: %d\n", error);
-    return -1.0f;
+  // Try multiple times in case Pi Pico is busy
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("Battery voltage attempt %d/3\n", attempt);
+    
+    Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+    Wire.write(CMD_GET_BATTERY);
+    uint8_t error = Wire.endTransmission();
+    
+    if (error != 0) {
+      Serial.printf("Failed to send battery command, error: %d", error);
+      if (error == 2) {
+        Serial.println(" (NACK on address - Pi Pico not responding)");
+      } else if (error == 5) {
+        Serial.println(" (Timeout - Pi Pico may be busy)");
+      } else {
+        Serial.printf(" (Unknown I2C error)\n");
+      }
+      
+      if (attempt < 3) {
+        Serial.printf("Waiting 200ms before retry...\n");
+        delay(200); // Wait longer between retries
+        continue;
+      }
+      return -1.0f;
+    }
+    
+    // Wait longer for Pi Pico to prepare response, especially if it's processing images
+    delay(100); // Increased from 50ms to 100ms
+    
+    Wire.requestFrom(PI_PICO_I2C_ADDRESS, 4);
+    
+    // Wait up to 500ms for response
+    unsigned long start = millis();
+    while (Wire.available() < 4 && (millis() - start) < 500) {
+      delay(10);
+    }
+    
+    if (Wire.available() >= 4) {
+      float voltage;
+      uint8_t* voltage_bytes = (uint8_t*)&voltage;
+      for (int i = 0; i < 4; i++) {
+        voltage_bytes[i] = Wire.read();
+      }
+      
+      // Validate voltage reading (should be between 2.5V and 5.0V)
+      if (voltage >= 2.5f && voltage <= 5.0f) {
+        Serial.printf("✓ Battery voltage: %.3f V (attempt %d)\n", voltage, attempt);
+        return voltage;
+      } else {
+        Serial.printf("✗ Invalid battery voltage: %.3f V (attempt %d)\n", voltage, attempt);
+        if (attempt < 3) {
+          delay(200);
+          continue;
+        }
+      }
+    } else {
+      Serial.printf("Failed to read battery voltage response (got %d bytes, attempt %d)\n", 
+                   Wire.available(), attempt);
+      if (attempt < 3) {
+        delay(200);
+        continue;
+      }
+    }
   }
   
-  delay(50); // Give Pi Pico time to prepare response
+  Serial.println("✗ All battery voltage attempts failed - Pi Pico may be unresponsive");
+  return -1.0f;
+}
+
+// Send battery information to Pi Pico for display overlay
+bool sendBatteryInfoToDisplay(float voltage, uint32_t cycles) {
+  Serial.printf("Sending battery info to display: %.2fV, %d cycles\n", voltage, cycles);
   
-  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 4);
-  if (Wire.available() >= 4) {
-    float voltage;
-    uint8_t* voltage_bytes = (uint8_t*)&voltage;
-    for (int i = 0; i < 4; i++) {
-      voltage_bytes[i] = Wire.read();
-    }
-    Serial.printf("✓ Battery voltage: %.2f V\n", voltage);
-    return voltage;
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_SET_BATTERY_INFO);
+  
+  // Send voltage as 4-byte float
+  uint8_t* voltage_bytes = (uint8_t*)&voltage;
+  for (int i = 0; i < 4; i++) {
+    Wire.write(voltage_bytes[i]);
+  }
+  
+  // Send cycles as 4-byte uint32_t
+  uint8_t* cycle_bytes = (uint8_t*)&cycles;
+  for (int i = 0; i < 4; i++) {
+    Wire.write(cycle_bytes[i]);
+  }
+  
+  uint8_t error = Wire.endTransmission();
+  
+  if (error == 0) {
+    Serial.println("✓ Battery info sent to display");
+    return true;
   } else {
-    Serial.printf("Failed to read battery voltage response\n");
-    return -1.0f;
+    Serial.printf("✗ Failed to send battery info, error: %d\n", error);
+    return false;
   }
 }
 
@@ -691,8 +779,8 @@ uint32_t getWakeupInterval() {
 bool setWakeupInterval(uint32_t minutes) {
   Serial.printf("Setting wakeup interval to %lu minutes...\n", minutes);
   
-  if (minutes < 5 || minutes > 1440) {
-    Serial.printf("Invalid wakeup interval: %lu (must be 5-1440 minutes)\n", minutes);
+  if (minutes < 1 || minutes > 43800) {
+    Serial.printf("Invalid wakeup interval: %lu (must be 1-43800 minutes)\n", minutes);
     return false;
   }
   
@@ -735,31 +823,63 @@ bool setWakeupInterval(uint32_t minutes) {
 uint8_t getChargingStatus() {
   Serial.println("Requesting charging status from Pi Pico...");
   
-  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
-  Wire.write(CMD_GET_CHARGING);
-  uint8_t error = Wire.endTransmission();
-  
-  if (error != 0) {
-    Serial.printf("Failed to send charging status command, error: %d\n", error);
-    return 3; // Assume no external power on communication failure
-  }
-  
-  delay(50); // Give Pi Pico time to prepare response
-  
-  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
-  if (Wire.available()) {
-    uint8_t charging_status = Wire.read();
-    const char* status_text[] = {"Not Charging", "Charging", "Charge Complete", "No External Power"};
-    if (charging_status <= 3) {
-      Serial.printf("✓ Charging status: %s (%d)\n", status_text[charging_status], charging_status);
-    } else {
-      Serial.printf("✓ Charging status: Unknown (%d)\n", charging_status);
+  // Try multiple times in case Pi Pico is busy
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("Charging status attempt %d/3\n", attempt);
+    
+    Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+    Wire.write(CMD_GET_CHARGING);
+    uint8_t error = Wire.endTransmission();
+    
+    if (error != 0) {
+      Serial.printf("Failed to send charging status command, error: %d", error);
+      if (error == 2) {
+        Serial.println(" (NACK on address)");
+      } else if (error == 5) {
+        Serial.println(" (Timeout - Pi Pico busy)");
+      } else {
+        Serial.printf(" (Unknown error)\n");
+      }
+      
+      if (attempt < 3) {
+        delay(200);
+        continue;
+      }
+      return 3; // Assume no external power on persistent failure
     }
-    return charging_status;
-  } else {
-    Serial.printf("Failed to read charging status response\n");
-    return 3; // Assume no external power on communication failure
+    
+    delay(100); // Give Pi Pico time to prepare response
+    
+    Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+    
+    // Wait up to 300ms for response
+    unsigned long start = millis();
+    while (Wire.available() < 1 && (millis() - start) < 300) {
+      delay(10);
+    }
+    
+    if (Wire.available()) {
+      uint8_t charging_status = Wire.read();
+      const char* status_text[] = {"Not Charging", "Charging", "Charge Complete", "No External Power"};
+      if (charging_status <= 3) {
+        Serial.printf("✓ Charging status: %s (%d) (attempt %d)\n", 
+                     status_text[charging_status], charging_status, attempt);
+      } else {
+        Serial.printf("✓ Charging status: Unknown (%d) (attempt %d)\n", 
+                     charging_status, attempt);
+      }
+      return charging_status;
+    } else {
+      Serial.printf("Failed to read charging status response (attempt %d)\n", attempt);
+      if (attempt < 3) {
+        delay(200);
+        continue;
+      }
+    }
   }
+  
+  Serial.println("✗ All charging status attempts failed");
+  return 3; // Assume no external power on persistent failure
 }
 
 // Put renderer to sleep immediately
@@ -967,12 +1087,136 @@ void handleFirmwareUpdate() {
 // URL MANAGEMENT FUNCTIONS
 // ========================================
 
-// Initialize URL storage and load existing URLs
-void initUrlStorage() {
-  Serial.println("Initializing URL storage...");
-  preferences.begin("photoframe", false);
+// Initialize battery data from persistent storage with wear leveling
+void initBatteryData() {
+  Serial.println("Initializing battery data from persistent storage...");
   
-  // Load URL count
+  // Load display cycle count from wear-leveled namespace
+  String namespace_base = "pf";
+  uint32_t highest_cycle = 0;
+  String active_namespace = "pf0"; // Default
+  
+  // Find the most recent namespace (same as URL storage)
+  for (int ns = 0; ns < 8; ns++) {
+    String test_namespace = namespace_base + String(ns);
+    preferences.begin(test_namespace.c_str(), true); // Read-only
+    
+    uint32_t cycle = preferences.getInt("writeCycle", 0);
+    if (cycle > 0 && cycle > highest_cycle) {
+      highest_cycle = cycle;
+      active_namespace = test_namespace;
+    }
+    preferences.end();
+  }
+  
+  // Load battery data from active namespace
+  preferences.begin(active_namespace.c_str(), false);
+  display_cycle_count = preferences.getUInt("displayCycles", 0);
+  uint8_t last_charging_state = preferences.getUChar("lastCharging", 3);
+  
+  // Load last known good battery voltage (fallback if I2C fails)
+  float last_known_voltage = preferences.getFloat("lastVoltage", 3.7f);
+  preferences.end();
+  
+  Serial.printf("✓ Loaded battery data: %d display cycles, last charging state: %d, last voltage: %.3fV\n", 
+               display_cycle_count, last_charging_state, last_known_voltage);
+  
+  // Try to get current battery values from hardware
+  Serial.println("Attempting to get current battery status from Pi Pico...");
+  current_battery_voltage = getBatteryVoltage();
+  current_charging_status = getChargingStatus();
+  
+  // If I2C communication failed, use last known values but mark as stale
+  if (current_battery_voltage < 0) {
+    Serial.printf("⚠ I2C communication failed - using last known voltage: %.3fV\n", last_known_voltage);
+    current_battery_voltage = last_known_voltage;
+  } else {
+    // Save successful reading for future use
+    preferences.begin(active_namespace.c_str(), false);
+    preferences.putFloat("lastVoltage", current_battery_voltage);
+    preferences.end();
+  }
+  
+  // Check if we just transitioned to full charge (reset cycles)
+  if (last_charging_state != 2 && current_charging_status == 2) {
+    Serial.println("🔋 Battery just completed charging - resetting cycle count");
+    display_cycle_count = 0;
+    saveBatteryData();
+  }
+  
+  int battery_percentage = calculateBatteryPercentage(current_battery_voltage);
+  Serial.printf("✓ Battery initialization complete: %.3fV, %d%%, %d cycles\n", 
+               current_battery_voltage, battery_percentage, display_cycle_count);
+  
+  if (current_battery_voltage < 0) {
+    Serial.println("⚠ Warning: Battery monitoring may be unreliable due to I2C communication issues");
+    Serial.println("  → Check Pi Pico connection and ensure it's running properly");
+  }
+}
+
+// Save battery data to persistent storage with wear leveling
+void saveBatteryData() {
+  // Use same wear leveling as URL storage
+  String namespace_base = "pf";
+  uint32_t current_cycle = write_cycle_counter;
+  String active_namespace = namespace_base + String(current_cycle % 8);
+  
+  preferences.begin(active_namespace.c_str(), false);
+  preferences.putUInt("displayCycles", display_cycle_count);
+  preferences.putUChar("lastCharging", current_charging_status);
+  
+  // Save last known voltage if valid
+  if (current_battery_voltage > 0) {
+    preferences.putFloat("lastVoltage", current_battery_voltage);
+  }
+  preferences.end();
+  
+  Serial.printf("Saved battery data to %s: %d cycles, charging state %d, voltage %.3fV\n", 
+               active_namespace.c_str(), display_cycle_count, current_charging_status, current_battery_voltage);
+}
+
+// Initialize URL storage and load existing URLs with wear leveling support
+void initUrlStorage() {
+  Serial.println("Initializing wear-leveled URL storage...");
+  
+  // FLASH WEAR LEVELING: Find the most recent namespace with valid data
+  String namespace_base = "pf";
+  uint32_t highest_cycle = 0;
+  String active_namespace = "photoframe"; // Fallback to old namespace
+  bool found_wear_leveled = false;
+  
+  // Check all 8 wear-leveling namespaces to find the newest one
+  for (int ns = 0; ns < 8; ns++) {
+    String test_namespace = namespace_base + String(ns);
+    preferences.begin(test_namespace.c_str(), true); // Read-only
+    
+    uint32_t cycle = preferences.getInt("writeCycle", 0);
+    if (cycle > 0 && cycle > highest_cycle) {
+      highest_cycle = cycle;
+      active_namespace = test_namespace;
+      found_wear_leveled = true;
+    }
+    preferences.end();
+  }
+  
+  if (found_wear_leveled) {
+    write_cycle_counter = highest_cycle;
+    Serial.printf("Found wear-leveled data in namespace: %s (cycle %d)\n", active_namespace.c_str(), highest_cycle);
+  } else {
+    // Check old "photoframe" namespace for migration
+    preferences.begin("photoframe", true);
+    int old_count = preferences.getInt("urlCount", 0);
+    preferences.end();
+    
+    if (old_count > 0) {
+      Serial.println("Migrating from old storage format to wear-leveled storage...");
+      active_namespace = "photoframe";
+      write_cycle_counter = 1; // Start wear leveling
+    }
+  }
+  
+  // Load data from the active namespace
+  preferences.begin(active_namespace.c_str(), false);
   urlCount = preferences.getInt("urlCount", 0);
   currentUrlIndex = preferences.getInt("currentIdx", 0);
   
@@ -982,13 +1226,21 @@ void initUrlStorage() {
     imageUrls[0] = "https://raw.githubusercontent.com/FloThinksPi/PhotoPainter-ESP32/refs/heads/main/ImageConverter/Examples/arabella.bmp";
     urlCount = 1;
     currentUrlIndex = 0;
-    saveUrls();
+    preferences.end();
+    saveUrls(); // This will use wear leveling
   } else {
     // Load existing URLs
     for (int i = 0; i < urlCount && i < MAX_URLS; i++) {
       String key = "url" + String(i);
       imageUrls[i] = preferences.getString(key.c_str(), "");
       Serial.printf("Loaded URL %d: %s\n", i, imageUrls[i].c_str());
+    }
+    preferences.end();
+    
+    // If we migrated from old format, save with wear leveling now
+    if (!found_wear_leveled && urlCount > 0) {
+      Serial.println("Converting to wear-leveled storage...");
+      saveUrls();
     }
   }
   
@@ -997,27 +1249,124 @@ void initUrlStorage() {
     currentUrlIndex = 0;
   }
   
-  // Load admin password (initialize if not set)
-  adminPassword = preferences.getString("password", "photoframe2024");
-  Serial.printf("✓ Admin password loaded from storage\n");
+  // Load admin password with wear leveling support
+  adminPassword = "photoframe2024"; // Default
+  bool password_found = false;
+  
+  // Check wear-leveled admin namespaces (newest first)
+  for (int cycle = (write_cycle_counter / 4); cycle >= 0 && cycle > (write_cycle_counter / 4) - 4; cycle--) {
+    String admin_namespace = "admin" + String(cycle % 4);
+    preferences.begin(admin_namespace.c_str(), true);
+    String stored_password = preferences.getString("password", "");
+    preferences.end();
+    
+    if (stored_password.length() > 0) {
+      adminPassword = stored_password;
+      password_found = true;
+      Serial.printf("✓ Admin password loaded from wear-leveled namespace: %s\n", admin_namespace.c_str());
+      break;
+    }
+  }
+  
+  // Fallback to old namespace if no wear-leveled password found
+  if (!password_found) {
+    preferences.begin("photoframe", true);
+    String old_password = preferences.getString("password", "");
+    preferences.end();
+    
+    if (old_password.length() > 0) {
+      adminPassword = old_password;
+      Serial.println("✓ Admin password loaded from legacy storage");
+    }
+  }
   
   Serial.printf("✓ URL storage initialized: %d URLs, current index: %d\n", urlCount, currentUrlIndex);
 }
 
 // Save URLs to persistent storage
 void saveUrls() {
+  // FLASH WEAR LEVELING: Distribute writes across different namespaces
+  // This prevents wearing out the same flash sectors by rotating storage locations
+  String namespace_base = "pf"; // Short namespace for efficiency
+  String namespace_name = namespace_base + String(write_cycle_counter % 8); // Rotate across 8 namespaces
+  
+  write_cycle_counter++; // Increment for next write cycle
+  
+  Serial.printf("Using wear-leveled namespace: %s (cycle %d)\n", namespace_name.c_str(), write_cycle_counter);
+  
+  preferences.end(); // Close current namespace
+  preferences.begin(namespace_name.c_str(), false); // Open rotated namespace
+  
   preferences.putInt("urlCount", urlCount);
   preferences.putInt("currentIdx", currentUrlIndex);
+  preferences.putInt("writeCycle", write_cycle_counter); // Store cycle counter for recovery
   
   for (int i = 0; i < urlCount; i++) {
     String key = "url" + String(i);
     preferences.putString(key.c_str(), imageUrls[i]);
   }
   
-  Serial.printf("✓ Saved %d URLs to storage\n", urlCount);
+  preferences.end(); // Ensure data is flushed
+  
+  // Clean up old namespace data (optional - helps free flash space)
+  if (write_cycle_counter > 8) {
+    String old_namespace = namespace_base + String((write_cycle_counter - 8) % 8);
+    Serial.printf("Cleaning old namespace: %s\n", old_namespace.c_str());
+    preferences.begin(old_namespace.c_str(), false);
+    preferences.clear(); // Clear old data
+    preferences.end();
+  }
+  
+  Serial.printf("✓ Saved %d URLs with wear leveling (cycle %d)\n", urlCount, write_cycle_counter);
 }
 
-// Get the current URL and advance to next
+// Save admin settings with wear leveling
+void saveAdminSettings() {
+  // FLASH WEAR LEVELING: Use separate namespace rotation for admin settings
+  String admin_namespace = "admin" + String((write_cycle_counter / 4) % 4); // Rotate every 4 cycles
+  
+  Serial.printf("Saving admin settings to wear-leveled namespace: %s\n", admin_namespace.c_str());
+  
+  preferences.begin(admin_namespace.c_str(), false);
+  preferences.putString("password", adminPassword);
+  preferences.end();
+  
+  Serial.println("✓ Admin settings saved with wear leveling");
+}
+
+// Calculate battery percentage from voltage using Li-ion discharge curve
+// Same algorithm as used in the display library for consistency
+int calculateBatteryPercentage(float voltage) {
+  if (voltage >= 4.0f) {
+    return 100; // Everything above 4.0V is 100%
+  } else if (voltage <= 3.3f) {
+    return 0;   // Everything below 3.3V is 0%
+  } else {
+    // Non-linear interpolation matching Li-ion discharge curve
+    // Using piecewise linear approximation of the curve
+    if (voltage >= 3.8f) {
+      // 4.0V-3.8V: 100% to 75% (steep drop at high voltage)
+      return 75 + (int)((voltage - 3.8f) / (4.0f - 3.8f) * 25.0f);
+    } else if (voltage >= 3.7f) {
+      // 3.8V-3.7V: 75% to 50% (moderate slope)
+      return 50 + (int)((voltage - 3.7f) / (3.8f - 3.7f) * 25.0f);
+    } else if (voltage >= 3.6f) {
+      // 3.7V-3.6V: 50% to 25% (moderate slope)
+      return 25 + (int)((voltage - 3.6f) / (3.7f - 3.6f) * 25.0f);
+    } else if (voltage >= 3.5f) {
+      // 3.6V-3.5V: 25% to 10% (getting steeper)
+      return 10 + (int)((voltage - 3.5f) / (3.6f - 3.5f) * 15.0f);
+    } else if (voltage >= 3.4f) {
+      // 3.5V-3.4V: 10% to 3% (steep drop)
+      return 3 + (int)((voltage - 3.4f) / (3.5f - 3.4f) * 7.0f);
+    } else {
+      // 3.4V-3.3V: 3% to 0% (very steep drop near cutoff)
+      return (int)((voltage - 3.3f) / (3.4f - 3.3f) * 3.0f);
+    }
+  }
+}
+
+// Get the current URL and advance to next with wear leveling
 String getCurrentUrlAndAdvance() {
   if (urlCount == 0) {
     return "";
@@ -1027,7 +1376,9 @@ String getCurrentUrlAndAdvance() {
   
   // Advance to next URL
   currentUrlIndex = (currentUrlIndex + 1) % urlCount;
-  preferences.putInt("currentIdx", currentUrlIndex);
+  
+  // FLASH WEAR LEVELING: Save with distributed writes instead of direct preferences.putInt
+  saveUrls(); // This uses wear leveling to save current index along with URLs
   
   Serial.printf("Using URL %d/%d: %s\n", (currentUrlIndex == 0 ? urlCount : currentUrlIndex), urlCount, currentUrl.c_str());
   Serial.printf("Next URL will be index %d\n", currentUrlIndex);
@@ -1143,8 +1494,33 @@ const char* getWebUI() {
   
   html += "<h1>&#128248; PhotoFrame Control Panel</h1><button class=\"logout\" onclick=\"logout()\">Logout</button>";
   html += "<div class=\"card\"><h2>&#128202; System Status</h2>";
-  html += "<div class=\"i\">&#128267; Battery: <span class=\"" + String((current_battery_voltage > 3.5f) ? "good" : (current_battery_voltage > 3.2f) ? "low" : "crit") + "\">" + String(current_battery_voltage, 2) + "V</span> | &#9889; Charging: " + String((current_charging_status == 0) ? "Not Charging" : (current_charging_status == 1) ? "Charging" : (current_charging_status == 2) ? "Charge Complete" : "No External Power") + "</div>";
-  html += "<div class=\"i\">&#9200; Wakeup: " + String(current_wakeup_interval) + " min | &#127760; IP: " + ipAddress + " | &#128193; URLs: " + String(urlCount) + " (current: #" + String(currentUrlIndex + 1) + ")</div></div>";
+  
+  // Enhanced battery status with percentage and cycle count
+  int battery_percentage = calculateBatteryPercentage(current_battery_voltage);
+  String battery_color = (current_battery_voltage > 3.5f) ? "good" : (current_battery_voltage > 3.2f) ? "low" : "crit";
+  String percentage_indicator = "";
+  
+  // Add visual battery percentage indicator
+  if (battery_percentage >= 75) {
+    percentage_indicator = "🔋"; // Full battery
+  } else if (battery_percentage >= 50) {
+    percentage_indicator = "🔋"; // Medium battery 
+  } else if (battery_percentage >= 25) {
+    percentage_indicator = "🪫"; // Low battery
+  } else {
+    percentage_indicator = "🪫"; // Critical battery
+  }
+  
+  html += "<div class=\"i\">" + percentage_indicator + " Battery: <span class=\"" + battery_color + "\">" + 
+          String(current_battery_voltage, 3) + "V (" + String(battery_percentage) + "%)</span> | " +
+          "&#9889; Charging: " + String((current_charging_status == 0) ? "Not Charging" : 
+          (current_charging_status == 1) ? "Charging" : (current_charging_status == 2) ? 
+          "Charge Complete" : "No External Power") + "</div>";
+  
+  html += "<div class=\"i\">&#128472; Display Cycles: " + String(display_cycle_count) + " | " +
+          "&#9200; Wakeup: " + String(current_wakeup_interval) + " min | " +
+          "&#127760; IP: " + ipAddress + " | &#128193; URLs: " + String(urlCount) + 
+          " (current: #" + String(currentUrlIndex + 1) + ")</div></div>";
   
   html += "<div class=\"control-section\"><h2>&#127918; Manual Controls</h2>";
   html += "<button class=\"display\" onclick=\"displayCurrent()\">&#128444; Display Current Image</button>";
@@ -1157,7 +1533,7 @@ const char* getWebUI() {
   html += "<button class=\"add\" onclick=\"addUrl()\" style=\"min-width:80px\">&#10133; Add</button></div></div>";
   
   html += "<div class=\"f\"><h2>&#9881; Configuration</h2>";
-  html += "<input type=\"number\" id=\"wake\" min=\"5\" max=\"1440\" value=\"" + String(current_wakeup_interval) + "\" placeholder=\"Wakeup interval (5-1440 minutes)\">";
+  html += "<input type=\"number\" id=\"wake\" min=\"1\" max=\"43800\" value=\"" + String(current_wakeup_interval) + "\" placeholder=\"Wakeup interval (1-43800 minutes)\">";
   html += "<button onclick=\"update()\">&#128190; Update</button><button onclick=\"refreshPage()\">&#128472; Refresh</button></div>";
   
   html += "<div class=\"sec\"><h2>&#128274; Security</h2>";
@@ -1172,7 +1548,7 @@ const char* getWebUI() {
   // Add JavaScript functions
   html += "<script>";
   html += "function logout(){fetch('/logout',{method:'POST'}).then(()=>location.reload())}";
-  html += "function update(){const i=document.getElementById('wake').value;if(i>=5&&i<=1440)fetch('/setWakeup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'minutes='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)});else showStatus('Please enter 5-1440 minutes',false)}";
+  html += "function update(){const i=document.getElementById('wake').value;if(i>=1&&i<=43800)fetch('/setWakeup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'minutes='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)});else showStatus('Please enter 1-43800 minutes',false)}";
   html += "function addUrl(){const u=document.getElementById('url').value;if(u)fetch('/addUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success')){document.getElementById('url').value='';setTimeout(refreshPage,1500)}});else showStatus('Please enter a URL',false)}";
   html += "function deleteUrl(i){if(confirm('Delete this URL?'))fetch('/deleteUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)})}";
   html += "function displayImage(i){document.getElementById('control-status').innerHTML='&#128444; Displaying image #'+(i+1)+'...';fetch('/displayImage',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
@@ -1203,6 +1579,12 @@ void handleRoot() {
   current_battery_voltage = getBatteryVoltage();
   current_wakeup_interval = getWakeupInterval();
   current_charging_status = getChargingStatus();
+  
+  // Send battery info to display for overlay
+  if (current_battery_voltage > 0.0f) {
+    sendBatteryInfoToDisplay(current_battery_voltage, display_cycle_count);
+  }
+  
   last_status_update = millis();
   
   server.send(200, "text/html; charset=utf-8", getWebUI());
@@ -1277,12 +1659,10 @@ void handleChangePassword() {
     
     if (newPassword.length() >= 8) {
       adminPassword = newPassword;
-      preferences.begin("photoframe", false);
-      preferences.putString("password", adminPassword);
-      preferences.end();
+      saveAdminSettings(); // Use wear-leveled storage
       
       server.send(200, "text/plain", "Password changed successfully!");
-      Serial.println("Admin password updated");
+      Serial.println("Admin password updated with wear leveling");
     } else {
       server.send(400, "text/plain", "Password must be at least 8 characters long");
     }
@@ -1339,11 +1719,9 @@ void handleDisplayImage() {
   bool success = downloadAndConvertBmpImage(imageUrls[index].c_str());
   
   if (success) {
-    // Update current index to the displayed image
+    // Update current index to the displayed image with wear leveling
     currentUrlIndex = index;
-    preferences.begin("photoframe", false);
-    preferences.putInt("currentIndex", currentUrlIndex);
-    preferences.end();
+    saveUrls(); // Use wear-leveled storage instead of direct write
     
     server.send(200, "text/plain", "✓ Displaying image " + String(index + 1) + "/" + String(urlCount) + ": " + imageUrls[index]);
   } else {
@@ -1363,10 +1741,8 @@ void handleNextImage() {
     // Advance to next URL
     currentUrlIndex = (currentUrlIndex + 1) % urlCount;
     
-    // Save current index
-    preferences.begin("photoframe", false);
-    preferences.putInt("currentIndex", currentUrlIndex);
-    preferences.end();
+    // Save current index with wear leveling
+    saveUrls(); // Use wear-leveled storage instead of direct write
     
     Serial.printf("⏭️ Manual next image - advancing to URL %d/%d\n", currentUrlIndex + 1, urlCount);
     
@@ -1573,13 +1949,16 @@ void setup() {
       }
     }
   }
+
+  Serial.println("=== ESP32 I2C Master Ready===");
   
-  Serial.println("=== ESP32 ULTRA-FAST I2C Master READY ===");
+  // Initialize battery data now that I2C is ready
+  initBatteryData();
 }
 
 // Download and stream image directly to Pi Pico with MAXIMUM SPEED
 bool downloadAndStreamImage(const char* url) {
-  Serial.printf("Starting ULTRA-FAST streaming download from: %s\n", url);
+  Serial.printf("Starting streaming download from: %s\n", url);
   
   HTTPClient http;
   http.begin(url);
@@ -1601,9 +1980,9 @@ bool downloadAndStreamImage(const char* url) {
       size_t bytesRead = 0;
       uint32_t chunk_id = 0;
       unsigned long start_time = millis(); // For transfer speed calculation
-      
-      Serial.printf("ULTRA-FAST streaming %d bytes in chunks...\n", contentLength);
-      
+
+      Serial.printf("Streaming %d bytes in chunks...\n", contentLength);
+
       while (http.connected() && bytesRead < contentLength) {
         size_t available = stream->available();
         if (available) {
@@ -1636,20 +2015,27 @@ bool downloadAndStreamImage(const char* url) {
             if (bytesRead % 20000 == 0) { // Every 20KB (was 10KB)
               float percent = ((float)bytesRead / contentLength) * 100.0;
               float kbps = (millis() > start_time) ? (bytesRead / (float)(millis() - start_time)) : 0;
-              Serial.printf("ULTRA-FAST stream: %d/%d bytes (%.1f%%, %.1f KB/s)\n", 
+              Serial.printf("Streaming: %d/%d bytes (%.1f%%, %.1f KB/s)\n", 
                            bytesRead, contentLength, percent, kbps);
             }
           
           }
         }
       }
-      
-      Serial.printf("✓ ULTRA-FAST streaming completed: %d bytes in %d chunks\n", bytesRead, chunk_id);
+
+      Serial.printf("✓ Streaming completed: %d bytes in %d chunks\n", bytesRead, chunk_id);
       http.end();
       
       // Send render command immediately
       if (!sendRenderCommand()) {
         return false;
+      }
+      
+      // Send updated battery info to display after successful render
+      float voltage = getBatteryVoltage();
+      if (voltage > 0.0f) {
+        sendBatteryInfoToDisplay(voltage, display_cycle_count);
+        current_battery_voltage = voltage; // Update local cache
       }
       
       Serial.println("✓ Stream transfer and render command complete");
@@ -1724,7 +2110,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         return false;
       }
       
-      // Read headers with ULTRA-AGGRESSIVE buffering and timeout
+      // Read headers with aggressive buffering and timeout
       size_t header_read = 0;
       unsigned long start_time = millis();
       const unsigned long timeout = 2000; // 2 second timeout (was 3s) for maximum power efficiency
@@ -1807,7 +2193,7 @@ bool downloadAndConvertBmpImage(const char* url) {
           return false;
         }
         
-        // Read palette with ULTRA-FAST buffering
+        // Read palette with aggressive buffering
         size_t palette_read = 0;
         start_time = millis();
         
@@ -2087,6 +2473,13 @@ bool downloadAndConvertBmpImage(const char* url) {
           return false;
         }
         
+        // Send updated battery info to display after successful BMP render
+        float voltage = getBatteryVoltage();
+        if (voltage > 0.0f) {
+          sendBatteryInfoToDisplay(voltage, display_cycle_count);
+          current_battery_voltage = voltage; // Update local cache
+        }
+        
         Serial.println("✓ BMP streaming conversion and render command complete");
         return true;
     } else {
@@ -2168,6 +2561,8 @@ void loop() {
       
       if (new_voltage >= 0.0f) {
         current_battery_voltage = new_voltage;
+        // Send battery info to display for overlay  
+        sendBatteryInfoToDisplay(current_battery_voltage, display_cycle_count);
       }
       if (new_interval > 0) {
         current_wakeup_interval = new_interval;

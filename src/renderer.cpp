@@ -19,26 +19,38 @@
 
 // Forward declarations
 float measureVBAT(void);
+void initBatterySampling(void);
+void updateBatterySampling(void);
 uint8_t getChargingStatus();
 void saveWakeupInterval(uint32_t minutes);
 uint32_t loadWakeupInterval();
 void initPersistentStorage();
+uint32_t getCurrentSectorAddress();
+void saveWakeupIntervalWearLeveled(uint32_t minutes);
+uint32_t loadWakeupIntervalWearLeveled();
 
-// EEPROM addresses for persistent settings
+// EEPROM addresses for persistent settings with WEAR LEVELING
 #define EEPROM_SIZE 512          // Total EEPROM size to initialize
-#define EEPROM_MAGIC_ADDR 0      // Magic number to detect first boot
-#define EEPROM_WAKEUP_ADDR 4     // RTC wakeup interval address (4 bytes)
+#define WEAR_LEVELING_SECTORS 8  // Use 8 different sectors to distribute writes
+#define SECTOR_SIZE 32           // Each wear-leveling sector is 32 bytes
+#define MAGIC_OFFSET 0           // Magic number offset within sector
+#define WAKEUP_OFFSET 4          // Wakeup interval offset within sector
+#define CYCLE_OFFSET 8           // Write cycle counter offset within sector
+
 #define EEPROM_MAGIC_VALUE 0x12345678  // Magic number for validation
 
 // Default settings
 #define DEFAULT_WAKEUP_MINUTES 30
+
+// Wear leveling state
+static uint32_t eeprom_write_cycle = 0;
 
 // Power management variables (simplified) - MAXIMUM POWER EFFICIENCY
 static unsigned long button_press_time = 0;
 static unsigned long last_button_state = 1; // 1 = not pressed (pull-up)
 static const unsigned long TRANSFER_TIMEOUT_MS = 60000; // 60 seconds
 static const unsigned long BUTTON_DEBOUNCE_MS = 100;    // Reduced for faster response
-static const unsigned long POST_RENDER_DELAY_MS = 200; // ULTRA-FAST: 200ms (was 2000ms) - minimum for I2C completion
+static const unsigned long POST_RENDER_DELAY_MS = 200; // 200ms (was 2000ms) - minimum for I2C completion
 
 // Power-aware watchdog management
 static bool watchdog_enabled = false;
@@ -64,6 +76,8 @@ static unsigned long RTC_WAKEUP_INTERVAL_MS; // Calculated from minutes
 #define CMD_SET_WAKEUP        0x08  // Set RTC wakeup interval in minutes
 #define CMD_GET_CHARGING      0x09  // Get charging status (0=not charging, 1=charging, 2=charge complete)
 #define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
+#define CMD_SET_BATTERY_INFO  0x0B  // Set battery info for overlay display (voltage, cycles)
+#define CMD_GET_NEXT_IMAGE_REQUEST  0x0C  // Check if button was pressed to request next image
 
 // I2C Pin Configuration for Pi Pico (SLAVE) - ULTRA-OPTIMIZED
 #define I2C_SDA_PIN 4    // Pi Pico GPIO 4 (I2C0 SDA) -> ESP32 GPIO 21 (SDA)  
@@ -77,6 +91,22 @@ static uint32_t received_bytes = 0;
 static bool render_requested = false;
 static bool bmp_reorder_needed = false; // Flag to track if BMP reordering is needed
 static uint8_t status_response = 0; // 0=ready, 1=receiving, 2=rendering, 3=error
+
+// Battery overlay information
+static bool show_battery_overlay = false;
+static float battery_voltage = 0.0f;
+static uint32_t display_cycles = 0;
+
+// Continuous battery voltage sampling
+static float cached_battery_voltage = 3.7f;  // Cached voltage for instant I2C response
+static unsigned long last_battery_sample = 0;
+static const unsigned long BATTERY_SAMPLE_INTERVAL = 100; // Sample every 100ms
+static uint32_t battery_sample_buffer[64];  // Rolling buffer for 64 samples
+static uint8_t battery_sample_index = 0;
+static bool battery_sampling_initialized = false;
+
+// Next image request tracking
+static bool next_image_requested = false;
 
 extern const char *fileList;
 extern char pathName[];
@@ -214,8 +244,8 @@ void onI2CReceive(int bytes) {
                     new_interval |= ((uint32_t)Wire.read()) << 8;
                     new_interval |= Wire.read();
                     
-                    // Validate interval (5 minutes to 24 hours)
-                    if (new_interval >= 5 && new_interval <= 1440) {
+                    // Validate interval (1 minute to 30.42 days)
+                    if (new_interval >= 1 && new_interval <= 43800) {
                         RTC_WAKEUP_INTERVAL_MINUTES = new_interval;
                         RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000;
                         
@@ -225,7 +255,7 @@ void onI2CReceive(int bytes) {
                         Serial.printf("✓ RTC wakeup interval updated to %lu minutes and SAVED to EEPROM\n", RTC_WAKEUP_INTERVAL_MINUTES);
                         status_response = 0x82; // Success response for set wakeup
                     } else {
-                        Serial.printf("⚠ Invalid wakeup interval: %lu minutes (must be 5-1440)\n", new_interval);
+                        Serial.printf("⚠ Invalid wakeup interval: %lu minutes (must be 1-43800)\n", new_interval);
                         status_response = 0x83; // Error response for set wakeup
                     }
                 } else {
@@ -253,6 +283,49 @@ void onI2CReceive(int bytes) {
                 // Brief delay to send I2C response, then sleep
                 DEV_Delay_ms(100);
                 powerOff();
+                break;
+            }
+                
+            case CMD_SET_BATTERY_INFO: {
+                if (bytes >= 8) { // Need 8 bytes: 4 for voltage (float), 4 for cycles (uint32_t)
+                    // Read voltage as float (4 bytes)
+                    uint8_t voltage_bytes[4];
+                    voltage_bytes[0] = Wire.read();
+                    voltage_bytes[1] = Wire.read(); 
+                    voltage_bytes[2] = Wire.read();
+                    voltage_bytes[3] = Wire.read();
+                    memcpy(&battery_voltage, voltage_bytes, 4);
+                    
+                    // Read cycles as uint32_t (4 bytes) - little-endian to match ESP32 sender
+                    display_cycles = 0;
+                    display_cycles |= Wire.read();                    // LSB first
+                    display_cycles |= ((uint32_t)Wire.read()) << 8;
+                    display_cycles |= ((uint32_t)Wire.read()) << 16;
+                    display_cycles |= ((uint32_t)Wire.read()) << 24;  // MSB last
+                    
+                    show_battery_overlay = true;
+                    Serial.printf("✓ Battery overlay info set: %.2fV, %lu cycles\n", battery_voltage, display_cycles);
+                    status_response = 0x86; // Battery info set successfully
+                } else {
+                    // Flush remaining bytes for malformed command
+                    while (Wire.available()) Wire.read();
+                    status_response = 0x87; // Error response
+                    show_battery_overlay = false;
+                }
+                break;
+            }
+                
+            case CMD_GET_NEXT_IMAGE_REQUEST: {
+                // No additional data needed for this command
+                while (Wire.available()) Wire.read(); // Flush any remaining bytes
+                
+                if (next_image_requested) {
+                    status_response = 0x01; // Next image requested
+                    next_image_requested = false; // Clear the flag after reporting
+                    Serial.printf("✓ Next image request flag cleared and reported to ESP32\n");
+                } else {
+                    status_response = 0x00; // No next image request
+                }
                 break;
             }
                 
@@ -294,7 +367,7 @@ void onI2CRequest() {
 
 // Initialize I2C as slave using Arduino Wire library - ULTRA-OPTIMIZED
 void init_i2c() {
-    Serial.printf("Initializing ULTRA-FAST I2C slave on pins %d (SDA), %d (SCL) at address 0x%02X\n", 
+    Serial.printf("Initializing I2C slave on pins %d (SDA), %d (SCL) at address 0x%02X\n", 
                   I2C_SDA_PIN, I2C_SCL_PIN, I2C_SLAVE_ADDRESS);
     
     // Initialize I2C as slave with maximum speed settings
@@ -305,7 +378,7 @@ void init_i2c() {
     Wire.onReceive(onI2CReceive);
     Wire.onRequest(onI2CRequest);
     
-    Serial.printf("ULTRA-FAST I2C slave initialized at 800kHz\n");
+    Serial.printf("I2C slave initialized at 800kHz\n");
 }
 
 // I2C slave handler functions
@@ -450,7 +523,7 @@ void updatePowerAwareWatchdog() {
 
 // Reorder BMP data from sequential (BMP order) to display order - OPTIMIZED
 void reorderBmpToDisplay() {
-    Serial.println("ULTRA-FAST reordering BMP data to display format...");
+    Serial.println("reordering BMP data to display format...");
     
     const uint32_t width = 800;
     const uint32_t height = 480;
@@ -463,7 +536,7 @@ void reorderBmpToDisplay() {
         return;
     }
     
-    Serial.println("Applying ULTRA-FAST BMP to display transformations...");
+    Serial.println("Applying BMP to display transformations...");
     
     // The image_buffer currently contains BMP data in this order:
     // - Row 0 (bottom of image) followed by Row 1, Row 2, ... Row 479 (top of image)
@@ -515,12 +588,12 @@ void reorderBmpToDisplay() {
     memcpy(image_buffer, temp_buffer, 192000);
     free(temp_buffer);
     
-    Serial.println("✓ ULTRA-FAST BMP reordering completed");
+    Serial.println("✓ BMP reordering completed");
 }
 
 // Flip the image horizontally in place - ULTRA-OPTIMIZED
 void flipImageHorizontally() {
-    Serial.println("ULTRA-FAST horizontal flip to correct mirroring...");
+    Serial.println("horizontal flip to correct mirroring...");
     
     const uint32_t width = 800;
     const uint32_t height = 480;
@@ -546,7 +619,34 @@ void flipImageHorizontally() {
         image_buffer[i] = ((current_byte & 0x0F) << 4) | ((current_byte & 0xF0) >> 4);
     }
 
-    Serial.println("✓ ULTRA-FAST image flipped horizontally");
+    Serial.println("✓ image flipped horizontally");
+}
+
+// Rotate the image 180 degrees in place - corrects upside down orientation
+void rotateImage180() {
+    Serial.println("180-degree rotation to correct orientation...");
+    
+    const uint32_t width = 800;
+    const uint32_t height = 480;
+    const uint32_t bytes_per_row = width / 2; // 400 bytes per row (2 pixels per byte)
+    const uint32_t total_bytes = bytes_per_row * height;
+    
+    // Swap bytes from opposite ends of the entire image buffer
+    for (uint32_t i = 0; i < total_bytes / 2; i++) {
+        uint32_t opposite = total_bytes - 1 - i;
+        uint8_t temp = image_buffer[i];
+        image_buffer[i] = image_buffer[opposite];
+        image_buffer[opposite] = temp;
+    }
+    
+    // After swapping bytes, we need to swap the nibbles (pixels) within each byte
+    // because the pixel order within bytes is also reversed
+    for (uint32_t i = 0; i < total_bytes; i++) {
+        uint8_t current_byte = image_buffer[i];
+        image_buffer[i] = ((current_byte & 0x0F) << 4) | ((current_byte & 0xF0) >> 4);
+    }
+
+    Serial.println("✓ image rotated 180 degrees");
 }
 
 // Render the image from the buffer - ULTRA-OPTIMIZED
@@ -559,7 +659,10 @@ void renderImage() {
     // Flip the image horizontally before displaying to correct mirroring
     flipImageHorizontally();
     
-    Serial.printf("ULTRA-FAST rendering image from buffer (%d bytes)...\n", received_bytes);
+    // OPTIONAL: Uncomment the next line if image is still upside down relative to text
+    // rotateImage180();
+    
+    Serial.printf("rendering image from buffer (%d bytes)...\n", received_bytes);
     
     // Expected size for e-paper display: 800x480 pixels, 4 bits per pixel = 192,000 bytes
     const uint32_t expected_size = 192000;
@@ -576,11 +679,11 @@ void renderImage() {
             memset(&image_buffer[received_bytes], 0, expected_size - received_bytes);
         }
         
-        // Call the display function with exactly 192,000 bytes
-        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f);
+        // Call the display function with exactly 192,000 bytes and battery overlay info
+        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f, show_battery_overlay, battery_voltage, display_cycles);
         
         if (display_result == 0) {
-            Serial.printf("✓ ULTRA-FAST image displayed successfully! (%d bytes)\n", expected_size);
+            Serial.printf("✓ image displayed successfully! (%d bytes)\n", expected_size);
         } else {
             Serial.printf("⚠ Display function returned error %d, but continuing\n", display_result);
         }
@@ -589,14 +692,14 @@ void renderImage() {
                      received_bytes, expected_size);
     }
     
-    Serial.printf("✓ ULTRA-FAST image rendering completed! (%d bytes)\n", received_bytes);
+    Serial.printf("✓ image rendering completed! (%d bytes)\n", received_bytes);
     
     // Keep the data and status for a while so fetcher knows we're done
     status_response = 0; // ready for next image  
     render_requested = false;
     render_was_completed = true; // Set the completion flag
     
-    // ULTRA-FAST power-off in battery mode after MINIMAL delay
+    // power-off in battery mode after MINIMAL delay
     if (!DEV_Digital_Read(VBUS)) {
         Serial.printf("✓ Battery mode render complete - setting up next RTC wake-up\n");
         
@@ -605,7 +708,7 @@ void renderImage() {
         
         Serial.printf("✓ Next RTC wake-up configured - powering off in %d ms\n", POST_RENDER_DELAY_MS);
         DEV_Delay_ms(POST_RENDER_DELAY_MS); // MINIMAL delay (200ms) to ensure I2C completion
-        Serial.printf("ULTRA-FAST powering off after successful render...\n");
+        Serial.printf("powering off after successful render...\n");
         powerOff();
     }
     
@@ -624,12 +727,60 @@ Mode 2: pic folder name is not automatically obtained, users need to create file
 
 float measureVBAT(void)
 {
-    float Voltage=0.0;
-    const float conversion_factor = 3.3f / (1 << 12);
-    uint16_t result = adc_read();
-    Voltage = result * conversion_factor * 3;
-    Serial.printf("Raw value: 0x%03x, voltage: %f V\n", result, Voltage);
-    return Voltage;
+    // Return cached value for instant I2C response
+    return cached_battery_voltage;
+}
+
+// Initialize continuous battery sampling
+void initBatterySampling() {
+    // Initialize rolling buffer with current ADC reading
+    uint16_t initial_reading = adc_read();
+    for (int i = 0; i < 64; i++) {
+        battery_sample_buffer[i] = initial_reading;
+    }
+    battery_sample_index = 0;
+    battery_sampling_initialized = true;
+    last_battery_sample = millis();
+    
+    Serial.println("Battery sampling initialized with 64-sample rolling buffer");
+}
+
+// Update battery voltage sampling (call regularly from main loop)
+void updateBatterySampling() {
+    if (!battery_sampling_initialized) {
+        return;
+    }
+    
+    unsigned long now = millis();
+    if (now - last_battery_sample >= BATTERY_SAMPLE_INTERVAL) {
+        // Take a new ADC sample
+        uint16_t new_sample = adc_read();
+        
+        // Add to rolling buffer
+        battery_sample_buffer[battery_sample_index] = new_sample;
+        battery_sample_index = (battery_sample_index + 1) % 64;
+        
+        // Calculate average from rolling buffer
+        uint32_t total = 0;
+        for (int i = 0; i < 64; i++) {
+            total += battery_sample_buffer[i];
+        }
+        uint16_t avg_result = total / 64;
+        
+        // Update cached voltage
+        const float conversion_factor = 3.3f / (1 << 12);
+        cached_battery_voltage = avg_result * conversion_factor * 3.0f;
+        
+        last_battery_sample = now;
+        
+        // Debug output every 10 seconds
+        static unsigned long last_debug = 0;
+        if (now - last_debug >= 10000) {
+            Serial.printf("Battery sampling: raw=0x%03x, voltage=%.3fV (cached)\n", 
+                         avg_result, cached_battery_voltage);
+            last_debug = now;
+        }
+    }
 }
 
 void chargeState_callback(uint gpio, uint32_t events) 
@@ -731,7 +882,7 @@ void printPowerConfig() {
     Serial.printf("=== POWER MANAGEMENT CONFIGURATION ===\r\n");
     Serial.printf("RTC Wake-up Interval: %lu minutes\r\n", RTC_WAKEUP_INTERVAL_MINUTES);
     Serial.printf("Transfer Timeout: %lu seconds\r\n", TRANSFER_TIMEOUT_MS / 1000);
-    Serial.printf("Post-Render Delay: %lu ms (ULTRA-FAST)\r\n", POST_RENDER_DELAY_MS);
+    Serial.printf("Post-Render Delay: %lu ms  \r\n", POST_RENDER_DELAY_MS);
     Serial.printf("Button Debounce: %lu ms\r\n", BUTTON_DEBOUNCE_MS);
     Serial.printf("Power-Aware Watchdog: ENABLED\r\n");
     Serial.printf("  🔋 Battery Mode: 1000ms timeout active\r\n");
@@ -755,74 +906,109 @@ void run_display(Time_data Time, Time_data alarmTime)
 
 // Initialize EEPROM and load settings from persistent storage
 void initPersistentStorage() {
-    Serial.println("Initializing persistent storage...");
+    Serial.println("Initializing wear-leveled persistent storage...");
     EEPROM.begin(EEPROM_SIZE);
     
-    // Check if this is first boot by reading magic number
-    uint32_t magic;
-    EEPROM.get(EEPROM_MAGIC_ADDR, magic);
-    
-    if (magic != EEPROM_MAGIC_VALUE) {
-        // First boot - initialize EEPROM with defaults
-        Serial.println("First boot detected - initializing EEPROM with default settings");
-        EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
-        EEPROM.put(EEPROM_WAKEUP_ADDR, (uint32_t)DEFAULT_WAKEUP_MINUTES);
-        EEPROM.commit();
-        RTC_WAKEUP_INTERVAL_MINUTES = DEFAULT_WAKEUP_MINUTES;
-    } else {
-        // Load existing settings
-        RTC_WAKEUP_INTERVAL_MINUTES = loadWakeupInterval();
-        Serial.printf("Loaded RTC wakeup interval from EEPROM: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
-    }
+    // Load settings using wear-leveled approach
+    RTC_WAKEUP_INTERVAL_MINUTES = loadWakeupIntervalWearLeveled();
+    Serial.printf("Loaded RTC wakeup interval with wear leveling: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
     
     // Calculate milliseconds from minutes
     RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000;
     
-    Serial.printf("✓ Persistent storage initialized - wakeup interval: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
+    Serial.printf("✓ Wear-leveled persistent storage initialized - wakeup interval: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
 }
 
-// Save wakeup interval to EEPROM
-void saveWakeupInterval(uint32_t minutes) {
-    Serial.printf("Saving wakeup interval to EEPROM: %lu minutes\n", minutes);
-    EEPROM.put(EEPROM_WAKEUP_ADDR, minutes);
-    EEPROM.commit();
-    Serial.println("✓ Wakeup interval saved to EEPROM");
+// Get current sector address for wear leveling
+uint32_t getCurrentSectorAddress() {
+    return (eeprom_write_cycle % WEAR_LEVELING_SECTORS) * SECTOR_SIZE;
 }
 
-// Load wakeup interval from EEPROM
-uint32_t loadWakeupInterval() {
-    uint32_t minutes;
-    EEPROM.get(EEPROM_WAKEUP_ADDR, minutes);
+// Save wakeup interval with wear leveling
+void saveWakeupIntervalWearLeveled(uint32_t minutes) {
+    eeprom_write_cycle++; // Increment wear leveling counter
+    uint32_t sector_addr = getCurrentSectorAddress();
     
-    // Validate loaded value
-    if (minutes < 5 || minutes > 1440) {
-        Serial.printf("Invalid wakeup interval in EEPROM: %lu - using default\n", minutes);
-        minutes = DEFAULT_WAKEUP_MINUTES;
-        saveWakeupInterval(minutes); // Save corrected value
+    Serial.printf("Saving wakeup interval with wear leveling: %lu minutes to sector %lu (cycle %lu)\n", 
+                  minutes, sector_addr / SECTOR_SIZE, eeprom_write_cycle);
+    
+    // Write to wear-leveled sector
+    EEPROM.put(sector_addr + MAGIC_OFFSET, EEPROM_MAGIC_VALUE);
+    EEPROM.put(sector_addr + WAKEUP_OFFSET, minutes);
+    EEPROM.put(sector_addr + CYCLE_OFFSET, eeprom_write_cycle);
+    EEPROM.commit();
+    
+    Serial.println("✓ Wakeup interval saved with wear leveling");
+}
+
+// Load wakeup interval with wear leveling
+uint32_t loadWakeupIntervalWearLeveled() {
+    uint32_t highest_cycle = 0;
+    uint32_t best_minutes = DEFAULT_WAKEUP_MINUTES;
+    bool found_valid = false;
+    
+    // Check all wear-leveling sectors to find the most recent valid data
+    for (int sector = 0; sector < WEAR_LEVELING_SECTORS; sector++) {
+        uint32_t sector_addr = sector * SECTOR_SIZE;
+        
+        uint32_t magic, minutes, cycle;
+        EEPROM.get(sector_addr + MAGIC_OFFSET, magic);
+        EEPROM.get(sector_addr + WAKEUP_OFFSET, minutes);
+        EEPROM.get(sector_addr + CYCLE_OFFSET, cycle);
+        
+        // Check if this sector has valid data and is newer
+        if (magic == EEPROM_MAGIC_VALUE && cycle > highest_cycle) {
+            // Validate wakeup interval
+            if (minutes >= 1 && minutes <= 43800) {
+                highest_cycle = cycle;
+                best_minutes = minutes;
+                found_valid = true;
+                eeprom_write_cycle = cycle; // Update current cycle counter
+                
+                Serial.printf("Found valid wear-leveled data in sector %d: %lu minutes (cycle %lu)\n", 
+                              sector, minutes, cycle);
+            }
+        }
     }
     
-    return minutes;
+    if (!found_valid) {
+        Serial.println("No valid wear-leveled data found, using default");
+        // Initialize with wear leveling
+        saveWakeupIntervalWearLeveled(DEFAULT_WAKEUP_MINUTES);
+    }
+    
+    return best_minutes;
+}
+
+// Legacy save function (now uses wear leveling)
+void saveWakeupInterval(uint32_t minutes) {
+    saveWakeupIntervalWearLeveled(minutes);
+}
+
+// Legacy load function (now uses wear leveling)  
+uint32_t loadWakeupInterval() {
+    return loadWakeupIntervalWearLeveled();
 }
 
 void setup()
 {
     Serial.begin(115200);
-    DEV_Delay_ms(20); // ULTRA-FAST startup - reduced from 50ms
+    DEV_Delay_ms(20); // startup - reduced from 50ms
     
-    Serial.printf("=== ULTRA-FAST RENDERER STARTING ===\r\n");
+    Serial.printf("=== RENDERER STARTING ===\r\n");
     Serial.printf("MAXIMUM POWER EFFICIENCY MODE\r\n");
     
     // Initialize persistent storage first (loads RTC wakeup interval)
     initPersistentStorage();
     
-    // ULTRA-FAST hardware initialization (moved early for RTC access)
-    Serial.printf("ULTRA-FAST hardware init...\r\n");
+    // hardware initialization (moved early for RTC access)
+    Serial.printf("hardware init...\r\n");
     if(DEV_Module_Init() != 0) {
         Serial.printf("ERROR: DEV_Module_Init failed!\r\n");
         return;
     }
     
-    // ULTRA-FAST RTC initialization
+    // RTC initialization
     PCF85063_init();
     Serial.printf("RTC initialized\r\n");
     
@@ -861,9 +1047,13 @@ void setup()
     
     // Initialize I2C communication ULTRA-EARLY (before battery check for max responsiveness)
     init_i2c();
-    Serial.printf("ULTRA-FAST I2C slave ready at 800kHz\r\n");
+    Serial.printf("I2C slave ready at 800kHz\r\n");
     
-    // Check battery voltage last (can be slow)
+    // Initialize continuous battery sampling for instant I2C responses
+    initBatterySampling();
+    Serial.printf("Battery sampling system initialized\r\n");
+    
+    // Check battery voltage last (now uses cached value)
     float voltage = measureVBAT();
     if (voltage < 3.1) {
         Serial.printf("Low battery voltage: %.2fV - powering off\r\n", voltage);
@@ -871,16 +1061,19 @@ void setup()
         powerOff();
         return;
     } else {
-        Serial.printf("Battery OK: %.2fV - ULTRA-FAST operation ready\r\n", voltage);
+        Serial.printf("Battery OK: %.2fV - operation ready\r\n", voltage);
         ledPowerOn(); // Like original PhotoPainter
     }
     
-    Serial.printf("=== ULTRA-FAST READY FOR BUTTON/I2C ===\r\n");
+    Serial.printf("=== READY FOR BUTTON/I2C ===\r\n");
     Serial.printf("Total startup: POWER-AWARE - watchdog adapts to power state\r\n");
 }
 
 void loop()
 {
+    // Update battery sampling for accurate cached values
+    updateBatterySampling();
+    
     // Power-aware watchdog management - automatically handles external power changes
     updatePowerAwareWatchdog();
     
@@ -906,7 +1099,7 @@ void loop()
         if (detectButtonPress()) {
             current_activity = true;
             Serial.printf("Button pressed (short) - staying awake\n");
-            // ULTRA-FAST LED acknowledgment
+            // LED acknowledgment
             DEV_Digital_Write(LED_ACT, 1);
             DEV_Delay_ms(20); // Reduced from 50ms
             DEV_Digital_Write(LED_ACT, 0);
@@ -968,8 +1161,12 @@ void loop()
         
         // Check for short button press like original
         if (detectButtonPress()) {
-            Serial.printf("Button pressed (short) in USB mode\n");
-            // ULTRA-FAST LED feedback
+            Serial.printf("Button pressed (short) in USB mode - requesting next image\n");
+            
+            // Set flag to request next image
+            next_image_requested = true;
+            
+            // LED feedback
             DEV_Digital_Write(LED_ACT, 1);
             DEV_Delay_ms(20); // Reduced from 100ms
             DEV_Digital_Write(LED_ACT, 0);
@@ -984,7 +1181,7 @@ void loop()
             Serial.printf("RTC interrupt in USB mode - scheduled wake-up occurred\n");
         }
         
-        // ULTRA-FAST heartbeat (less verbose for power efficiency)
+        // heartbeat (less verbose for power efficiency)
         static unsigned long last_heartbeat = 0;
         if (millis() - last_heartbeat > 60000) { // Every 60 seconds (was 30s)
             Serial.printf("USB mode - %d bytes received\n", received_bytes);
@@ -992,6 +1189,6 @@ void loop()
         }
     }
     
-    // ULTRA-FAST polling for maximum button responsiveness and power efficiency
+    // polling for maximum button responsiveness and power efficiency
     DEV_Delay_ms(2); // Reduced from 5ms for even faster response while maintaining power efficiency
 }

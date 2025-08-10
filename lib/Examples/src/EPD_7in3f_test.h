@@ -38,7 +38,7 @@
 #include <stdint.h>
 
 int EPD_7in3f_display(float vol);
-int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float vol);
+int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float vol, bool show_battery_info = false, float battery_voltage = 0.0f, uint32_t display_cycles = 0);
 
 #endif
 

@@ -134,7 +134,7 @@ int EPD_7in3f_display(float vol)
     return 0;
 }
 
-int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float vol)
+int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float vol, bool show_battery_info, float battery_voltage, uint32_t display_cycles)
 {
     printf("e-Paper Init and Clear...\r\n");
     EPD_7IN3F_Init();
@@ -151,8 +151,85 @@ int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float v
     
     printf("✓ Using provided image buffer directly (no malloc needed)\r\n");
     
-    // Display the image data directly without any Paint operations that might modify it
-    printf("Displaying image data directly (%d bytes)\r\n", data_size);
+    // If battery overlay is requested, add it to the image buffer BEFORE displaying
+    if (show_battery_info || vol < 3.5f) {
+        printf("Adding battery overlay to image buffer (debug mode or low voltage)...\r\n");
+        
+        // CRITICAL: Set up Paint system FIRST before any drawing operations
+        printf("Setting up Paint system for text overlay...\r\n");
+        Paint_NewImage(Image, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT, 0, EPD_7IN3F_WHITE);
+        Paint_SetScale(7);  // Important: Set the color scale
+        Paint_SetRotate(ROTATE_90);  // Rotate 90 degrees instead of 270 to match image orientation
+        
+        // Create battery status text - centered at top of image
+        char battery_text[128];
+        
+        // Non-linear Li-ion battery percentage calculation based on discharge curve
+        // Values above 3.9V = 100%, below 3.3V = 0%, with curve-matched interpolation
+        int battery_percent;
+        if (battery_voltage >= 4.0f) {
+            battery_percent = 100; // Everything above 3.9V is 100%
+        } else if (battery_voltage <= 3.3f) {
+            battery_percent = 0;   // Everything below 3.3V is 0%
+        } else {
+            // Non-linear interpolation matching Li-ion discharge curve
+            // Using piecewise linear approximation of the curve
+            if (battery_voltage >= 3.8f) {
+                // 3.9V-3.8V: 100% to 75% (steep drop at high voltage)
+                battery_percent = 75 + (int)((battery_voltage - 3.8f) / (4.0f - 3.8f) * 25.0f);
+            } else if (battery_voltage >= 3.7f) {
+                // 3.8V-3.7V: 75% to 50% (moderate slope)
+                battery_percent = 50 + (int)((battery_voltage - 3.7f) / (3.8f - 3.7f) * 25.0f);
+            } else if (battery_voltage >= 3.6f) {
+                // 3.7V-3.6V: 50% to 25% (moderate slope)
+                battery_percent = 25 + (int)((battery_voltage - 3.6f) / (3.7f - 3.6f) * 25.0f);
+            } else if (battery_voltage >= 3.5f) {
+                // 3.6V-3.5V: 25% to 10% (getting steeper)
+                battery_percent = 10 + (int)((battery_voltage - 3.5f) / (3.6f - 3.5f) * 15.0f);
+            } else if (battery_voltage >= 3.4f) {
+                // 3.5V-3.4V: 10% to 3% (steep drop)
+                battery_percent = 3 + (int)((battery_voltage - 3.4f) / (3.5f - 3.4f) * 7.0f);
+            } else {
+                // 3.4V-3.3V: 3% to 0% (very steep drop near cutoff)
+                battery_percent = (int)((battery_voltage - 3.3f) / (3.4f - 3.3f) * 3.0f);
+            }
+        }
+        
+        // Ensure bounds
+        if (battery_percent < 0) battery_percent = 0;
+        if (battery_percent > 100) battery_percent = 100;
+        
+        if (battery_voltage < 3.2f) {
+            snprintf(battery_text, sizeof(battery_text), "Critical battery %d%% - please recharge immediately", battery_percent);
+        } else if (battery_voltage < 3.5f) {
+            snprintf(battery_text, sizeof(battery_text), "Low battery %d%% - please recharge", battery_percent);
+        } else {
+            snprintf(battery_text, sizeof(battery_text), "Battery %d%% (%.2fV) - %lu cycles since last charge", battery_percent, battery_voltage, display_cycles);
+        }
+        
+        printf("Drawing battery text: '%s' at position (10,10)\r\n", battery_text);
+        
+        // Draw a test rectangle to verify drawing is working (larger and more visible)
+        printf("Drawing test rectangle at (5,5) size 600x60\r\n");
+        Paint_DrawRectangle(5, 5, 600, 60, EPD_7IN3F_BLACK, DOT_PIXEL_3X3, DRAW_FILL_FULL);
+        
+        // Display main battery text at top with high contrast (white text on black background)
+        printf("Drawing white text on black background\r\n");
+        Paint_DrawString_EN(10, 15, battery_text, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+        
+        // Display cycle count on second line if low battery
+        if (battery_voltage < 3.2f) {
+            char cycle_text[64];
+            snprintf(cycle_text, sizeof(cycle_text), "Cycles since last charge: %lu", display_cycles);
+            printf("Drawing cycle text: '%s' at position (10,35)\r\n", cycle_text);
+            Paint_DrawString_EN(10, 35, cycle_text, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+        }
+        
+        printf("✓ Battery overlay added: %.2fV, %lu cycles\r\n", battery_voltage, display_cycles);
+    }
+    
+    // Display the image data with any overlay
+    printf("Displaying image data (%d bytes)\r\n", data_size);
     
     printf("EPD_Display\r\n");
     EPD_7IN3F_Display(Image);
