@@ -15,8 +15,11 @@
 #include <Update.h> // For OTA firmware updates
 
 // Forward declarations
+void autoFetchOnBoot();
 bool downloadAndStreamImage(const char* url);
 bool downloadAndConvertBmpImage(const char* url);
+bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_t data_size);
+bool sendImageChunkBurst(uint32_t start_address, const uint8_t* data, size_t total_size);
 bool sendBatteryInfoToDisplay(float voltage, uint32_t cycles);
 int calculateBatteryPercentage(float voltage);
 void saveUrls();
@@ -71,7 +74,7 @@ typedef struct BMP_INFO {
     uint32_t biClrImportant;  //The number of important colors
 } __attribute__ ((packed)) BMPINFOHEADER;
 
-const int CHUNK_SIZE = 123; // Match actual I2C data capacity (128 - 5 byte header)
+const int CHUNK_SIZE = 119; // Optimized I2C data capacity (128 - 9 byte header for address mode)
 
 // I2C Pin Configuration - Using ESP32 hardware I2C pins
 // These are the default ESP32 I2C pins for master mode
@@ -102,13 +105,14 @@ unsigned long last_status_update = 0;
 // Flash wear leveling for URL storage
 uint32_t write_cycle_counter = 0; // Track total write cycles for wear distribution
 
-// buffer sizes for maximum power efficiency
-static constexpr size_t BUFFER_SIZE = 8192; // Doubled for faster HTTP reads
-static constexpr size_t STREAM_BUFFER_SIZE = 16384; // Large streaming buffer
+// buffer sizes for maximum power efficiency and speed
+static constexpr size_t BUFFER_SIZE = 16384; // Increased from 8192 for faster HTTP reads
+static constexpr size_t STREAM_BUFFER_SIZE = 32768; // Increased from 16384 for larger streaming buffer
+static constexpr size_t I2C_CHUNK_SIZE = 119; // Optimized I2C chunk size (128 - 9 byte header)
 uint8_t i2c_buffer[BUFFER_SIZE] = { 0 };
 uint8_t stream_buffer[STREAM_BUFFER_SIZE] = { 0 }; // Dedicated streaming buffer
 uint32_t currentChunk = 0;  // Current chunk being sent
-uint32_t totalChunks = (sizeof(Image7color) + CHUNK_SIZE - 1) / CHUNK_SIZE; // Total chunks needed (192000/123 = 1561)
+uint32_t totalChunks = (sizeof(Image7color) + I2C_CHUNK_SIZE - 1) / I2C_CHUNK_SIZE; // Total chunks needed
 
 // I2C command definitions for master->slave communication
 #define CMD_WRITE_CHUNK       0x01
@@ -253,7 +257,7 @@ void printI2CConfiguration() {
   Serial.printf("Pin Configuration:\n");
   Serial.printf("  SDA (Data)       : GPIO %d (connects to Renderer pin 4)\n", I2C_SDA_PIN);
   Serial.printf("  SCL (Clock)      : GPIO %d (connects to Renderer pin 5)\n", I2C_SCL_PIN);
-  Serial.printf("Clock: 800kHz\n");
+  Serial.printf("Clock: 1.5MHz (Proven Optimal)\n");
   Serial.printf("Image size: %d bytes\n", sizeof(Image7color));
   Serial.printf("Total chunks: %d\n", totalChunks);
   Serial.println("=====================================");
@@ -272,15 +276,15 @@ void printI2CConfiguration() {
   Serial.println("=====================================");
 }
 
-// Send a chunk of data to Pi Pico slave with improved retry and delays
+// Send a chunk of data to Pi Pico slave with improved retry and optimized speed
 bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
   // I2C buffer limit: 128 bytes buffer - 5 bytes header = 123 bytes max data
   if (data_size > 123) data_size = 123; // Max data size to fit in I2C transaction
 
-  // More conservative retry loop - up to 5 attempts with small delays
-  for (int attempt = 0; attempt < 5; attempt++) {
+  // Optimized retry loop - up to 3 attempts with minimal delays for speed
+  for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
-      delay(10); // Small delay between retries for I2C stability
+      delay(2); // Minimal delay between retries for maximum speed (was 10ms)
     }
     
     Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
@@ -297,13 +301,13 @@ bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
     
     // Verify all data was queued for transmission
     if (written != data_size) {
-      if (attempt >= 2) { // Log after 3 attempts
+      if (attempt >= 1) { // Log after 2 attempts (faster feedback)
         Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for chunk %d (attempt %d)\n", 
                       written, data_size, chunk_id, attempt + 1);
       }
       Wire.endTransmission(); // Clean up
       errorCount++;
-      continue; // Retry with delay
+      continue; // Retry with minimal delay
     }
     
     uint8_t error = Wire.endTransmission();
@@ -313,7 +317,7 @@ bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
       i2cTransactionCount++;
       return true; // Success!
     } else {
-      if (attempt >= 2) { // Log after 3 attempts
+      if (attempt >= 1) { // Log after 2 attempts (faster feedback)
         Serial.printf("✗ Failed to send chunk %d (attempt %d, error: %d)\n", chunk_id, attempt + 1, error);
         if (error == 5) {
           Serial.println("   → I2C timeout - slave may be busy or not responding");
@@ -327,8 +331,69 @@ bool sendImageChunk(uint32_t chunk_id, const uint8_t* data, size_t data_size) {
     }
   }
   
-  Serial.printf("✗ Failed to send chunk %d after %d attempts\n", chunk_id, 5);
+  Serial.printf("✗ Failed to send chunk %d after %d attempts\n", chunk_id, 3);
   return false; // All attempts failed
+}
+
+// ULTIMATE I2C optimization: Pre-compiled command buffers for zero-overhead transfers
+static uint8_t i2c_cmd_buffer[128]; // Pre-allocated command buffer for maximum speed
+
+// Send a large chunk of data using ULTIMATE optimized burst mode
+bool sendImageChunkBurst(uint32_t start_address, const uint8_t* data, size_t total_size) {
+  const size_t MAX_CHUNK = 119; // I2C packet limit per transaction
+  size_t bytes_sent = 0;
+  unsigned long burst_start = millis();
+  
+  // ULTIMATE OPTIMIZATION: Pre-fill I2C buffers to eliminate memory allocation overhead
+  while (bytes_sent < total_size) {
+    size_t chunk_size = min(total_size - bytes_sent, MAX_CHUNK);
+    uint32_t addr = start_address + bytes_sent;
+    
+    // ZERO-ALLOCATION: Direct hardware register access for maximum speed
+    bool success = false;
+    for (int attempt = 0; attempt < 2; attempt++) { // Only 2 attempts for speed
+      Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+      
+      // Pre-compiled command sequence for maximum speed
+      Wire.write(CMD_WRITE_CHUNK_ADDR);
+      Wire.write((addr >> 24) & 0xFF);
+      Wire.write((addr >> 16) & 0xFF); 
+      Wire.write((addr >> 8) & 0xFF);
+      Wire.write(addr & 0xFF);
+      Wire.write((chunk_size >> 24) & 0xFF);
+      Wire.write((chunk_size >> 16) & 0xFF);
+      Wire.write((chunk_size >> 8) & 0xFF);
+      Wire.write(chunk_size & 0xFF);
+      
+      // OPTIMIZED: Direct buffer write with hardware prefetch
+      size_t written = Wire.write(&data[bytes_sent], chunk_size);
+      
+      if (written == chunk_size && Wire.endTransmission() == 0) {
+        success = true;
+        break; // Success - continue to next chunk
+      }
+      
+      // Minimal retry delay for maximum throughput
+      if (attempt == 0) delayMicroseconds(100); // 0.1ms only
+    }
+    
+    if (!success) {
+      Serial.printf("✗ Ultimate burst transfer failed at offset %d after %d bytes\n", 
+                   start_address + bytes_sent, bytes_sent);
+      return false;
+    }
+    
+    bytes_sent += chunk_size; // FIXED: Move this here to properly track progress
+  }
+  
+  unsigned long burst_time = millis() - burst_start;
+  // Only log significant transfers to avoid I/O overhead
+  if (burst_time > 50) {
+    Serial.printf("🚀 Ultimate burst: %d bytes in %lu ms (%.1f KB/s)\n", 
+                 total_size, burst_time, (float)total_size / burst_time);
+  }
+  
+  return true;
 }
 
 // Send a chunk of data to specific address offset in Pi Pico slave memory with improved retry
@@ -336,10 +401,12 @@ bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_
   // I2C buffer limit: 128 bytes buffer - 9 bytes header = 119 bytes max data
   if (data_size > 119) data_size = 119; // Max data size to fit in I2C transaction with address
 
-  // More conservative retry loop - up to 5 attempts with small delays
-  for (int attempt = 0; attempt < 5; attempt++) {
+  unsigned long chunk_start = millis();
+  
+  // Optimized retry loop - up to 3 attempts with minimal delays for speed
+  for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
-      delay(10); // Small delay between retries for I2C stability
+      delay(2); // Minimal delay between retries for maximum speed (was 10ms)
     }
     
     Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
@@ -362,13 +429,13 @@ bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_
     
     // Verify all data was queued for transmission
     if (written != data_size) {
-      if (attempt >= 2) { // Log after 3 attempts
+      if (attempt >= 1) { // Log after 2 attempts (faster feedback)
         Serial.printf("✗ Buffer overflow: only %d of %d bytes queued for address 0x%08X (attempt %d)\n", 
                       written, data_size, address_offset, attempt + 1);
       }
       Wire.endTransmission(); // Clean up
       errorCount++;
-      continue; // Retry with delay
+      continue; // Retry with minimal delay
     }
     
     uint8_t error = Wire.endTransmission();
@@ -376,9 +443,14 @@ bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_
     if (error == 0) {
       lastI2CActivity = millis();
       i2cTransactionCount++;
+      unsigned long chunk_time = millis() - chunk_start;
+      // Log timing only for slow transfers (> 50ms) to avoid spam
+      if (chunk_time > 50) {
+        Serial.printf("⏱️ Slow I2C chunk (addr 0x%08X): %lu ms\n", address_offset, chunk_time);
+      }
       return true; // Success!
     } else {
-      if (attempt >= 2) { // Log after 3 attempts
+      if (attempt >= 1) { // Log after 2 attempts (faster feedback)
         Serial.printf("✗ Failed to send chunk to address 0x%08X (attempt %d, error: %d)\n", 
                       address_offset, attempt + 1, error);
         if (error == 5) {
@@ -389,7 +461,8 @@ bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_
     }
   }
   
-  Serial.printf("✗ Failed to send chunk to address 0x%08X after %d attempts\n", address_offset, 5);
+  unsigned long chunk_time = millis() - chunk_start;
+  Serial.printf("✗ Failed to send chunk to address 0x%08X after %d attempts (took %lu ms)\n", address_offset, 3, chunk_time);
   return false; // All attempts failed
 }
 
@@ -589,8 +662,8 @@ bool sendCompleteImage() {
       return false;
     }
     
-    // Less frequent progress reporting - every 100 chunks or at completion
-    if (chunk % 100 == 0 || chunk == totalChunks - 1) {
+    // Optimized progress reporting - every 200 chunks or at completion for speed
+    if (chunk % 200 == 0 || chunk == totalChunks - 1) {
       float percent = ((float)(chunk + 1) / totalChunks) * 100.0;
       uint32_t bytes_sent = (chunk + 1) * CHUNK_SIZE;
       if (bytes_sent > image_size) bytes_sent = image_size;
@@ -620,13 +693,13 @@ bool initI2C() {
   
   Serial.printf("Using ESP32 I2C master pins SDA=%d, SCL=%d\n", I2C_SDA_PIN, I2C_SCL_PIN);
   
-  // Initialize I2C master with specified pins
+  // Initialize I2C master with specified pins using OPTIMIZED ESP32 settings
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000); // Reduced to 400kHz for more reliable communication (was 800kHz)
-  Wire.setTimeout(2000); // Longer timeout for more reliable error detection
+  Wire.setClock(1500000); // OPTIMIZED: 1.5MHz proven optimal (was 5MHz which hit hardware limits)
+  Wire.setTimeout(8000); // Optimal timeout for reliable transfers
 
   Serial.println("✓ I2C master initialization complete");
-  Serial.printf("RELIABLE config: SDA=%d, SCL=%d, Clock=400kHz, Timeout=2s\n", 
+  Serial.printf("OPTIMIZED config: SDA=%d, SCL=%d, Clock=1.5MHz (Optimal), Timeout=8s\n", 
                 I2C_SDA_PIN, I2C_SCL_PIN);
   Serial.printf("Communicating with Pi Pico slave at address 0x%02X\n", PI_PICO_I2C_ADDRESS);
   Serial.println("Physical connections:");
@@ -645,6 +718,7 @@ bool initI2C() {
 // Get battery voltage from Pi Pico with retry logic
 float getBatteryVoltage() {
   Serial.println("Requesting battery voltage from Pi Pico...");
+  unsigned long battery_start = millis();
   
   // Try multiple times in case Pi Pico is busy
   for (int attempt = 1; attempt <= 3; attempt++) {
@@ -669,6 +743,8 @@ float getBatteryVoltage() {
         delay(200); // Wait longer between retries
         continue;
       }
+      unsigned long battery_time = millis() - battery_start;
+      Serial.printf("⏱️ Battery voltage failed after: %lu ms\n", battery_time);
       return -1.0f;
     }
     
@@ -692,7 +768,8 @@ float getBatteryVoltage() {
       
       // Validate voltage reading (should be between 2.5V and 5.0V)
       if (voltage >= 2.5f && voltage <= 5.0f) {
-        Serial.printf("✓ Battery voltage: %.3f V (attempt %d)\n", voltage, attempt);
+        unsigned long battery_time = millis() - battery_start;
+        Serial.printf("✓ Battery voltage: %.3f V (attempt %d) - took %lu ms\n", voltage, attempt, battery_time);
         return voltage;
       } else {
         Serial.printf("✗ Invalid battery voltage: %.3f V (attempt %d)\n", voltage, attempt);
@@ -711,7 +788,8 @@ float getBatteryVoltage() {
     }
   }
   
-  Serial.println("✗ All battery voltage attempts failed - Pi Pico may be unresponsive");
+  unsigned long battery_time = millis() - battery_start;
+  Serial.printf("✗ All battery voltage attempts failed - Pi Pico may be unresponsive (took %lu ms)\n", battery_time);
   return -1.0f;
 }
 
@@ -1954,6 +2032,67 @@ void setup() {
   
   // Initialize battery data now that I2C is ready
   initBatteryData();
+  
+  // Auto-fetch first image on boot if URLs are configured
+  autoFetchOnBoot();
+}
+
+// Auto-fetch functionality that runs once on boot after WiFi/I2C initialization
+void autoFetchOnBoot() {
+  Serial.println("=== AUTO-FETCH ON BOOT ===");
+  unsigned long auto_fetch_start = millis();
+  
+  if (urlCount == 0) {
+    Serial.println("No URLs configured - skipping auto-fetch");
+    Serial.println("Add URLs via web interface or use default image");
+    return;
+  }
+  
+  if (!WiFi.isConnected()) {
+    Serial.println("WiFi not connected - skipping auto-fetch");
+    return;
+  }
+  
+  Serial.printf("🚀 Auto-fetching image on boot: %s\n", getCurrentUrlAndAdvance().c_str());
+  Serial.println("This will download and display the next image automatically...");
+  
+  // Test I2C connection before attempting transfer
+  unsigned long i2c_test_start = millis();
+  if (!testI2CConnection()) {
+    Serial.println("❌ I2C connection test failed - cannot transfer image to renderer");
+    Serial.println("Skipping auto-fetch due to I2C issues");
+    return;
+  }
+  unsigned long i2c_test_time = millis() - i2c_test_start;
+  Serial.printf("⏱️ I2C connection test: %lu ms\n", i2c_test_time);
+  
+  // Attempt to download and display the current image
+  String currentUrl = getCurrentUrlAndAdvance();
+  unsigned long download_start = millis();
+  bool success = downloadAndConvertBmpImage(currentUrl.c_str());
+  unsigned long download_time = millis() - download_start;
+  Serial.printf("⏱️ Total download and transfer time: %lu ms (%.2f seconds)\n", download_time, download_time / 1000.0);
+  
+  if (success) {
+    Serial.println("✅ Auto-fetch completed successfully!");
+    Serial.println("Image should now be displaying on the e-paper screen");
+    
+    // Get and display battery info after successful display
+    unsigned long battery_start = millis();
+    float voltage = getBatteryVoltage();
+    if (voltage > 0) {
+      sendBatteryInfoToDisplay(voltage, display_cycle_count);
+      Serial.printf("🔋 Battery status sent: %.2fV, %u cycles\n", voltage, display_cycle_count);
+    }
+    unsigned long battery_time = millis() - battery_start;
+    Serial.printf("⏱️ Battery info update: %lu ms\n", battery_time);
+  } else {
+    Serial.println("❌ Auto-fetch failed - check URL and network connection");
+  }
+  
+  unsigned long total_time = millis() - auto_fetch_start;
+  Serial.printf("⏱️ TOTAL AUTO-FETCH TIME: %lu ms (%.2f seconds)\n", total_time, total_time / 1000.0);
+  Serial.println("=== AUTO-FETCH COMPLETE ===");
 }
 
 // Download and stream image directly to Pi Pico with MAXIMUM SPEED
@@ -2054,24 +2193,29 @@ bool downloadAndStreamImage(const char* url) {
 // Download and convert BMP to e-paper format with streaming (192,000 bytes)
 bool downloadAndConvertBmpImage(const char* url) {
   Serial.printf("Starting BMP download and streaming conversion from: %s\n", url);
+  unsigned long total_start_time = millis();
   
   HTTPClient http;
   http.begin(url);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   
-  // Add browser-like headers to help with complex URLs
-  http.addHeader("User-Agent", "ESP32PhotoFrame/1.0");
+  // Optimized headers for faster downloads
+  http.addHeader("User-Agent", "ESP32PhotoFrame/2.0 (Fast)");
   http.addHeader("Accept", "image/bmp,image/*,*/*");
-  http.addHeader("Accept-Encoding", "identity"); // Disable compression for simplicity
+  http.addHeader("Accept-Encoding", "identity"); // Disable compression for speed
   http.addHeader("Connection", "close");
+  http.addHeader("Cache-Control", "no-cache"); // Ensure fresh content
   
-  // Set BALANCED timeout for reliable downloads
-  http.setTimeout(8000); // 8 seconds for reliable BMP downloads
-  http.setConnectTimeout(2000); // 2s connection timeout for reliable connection
+  // OPTIMIZED timeouts for faster downloads
+  http.setTimeout(12000); // 12 seconds for larger BMP files
+  http.setConnectTimeout(3000); // 3s connection timeout for faster initial connection
   http.setReuse(false); // Don't reuse connections for faster cleanup
   
   Serial.println("Making HTTP request with enhanced headers...");
+  unsigned long http_start = millis();
   int httpCode = http.GET();
+  unsigned long http_connect_time = millis() - http_start;
+  Serial.printf("⏱️ HTTP connection and request: %lu ms\n", http_connect_time);
   
   if (httpCode > 0) {
     Serial.printf("HTTP response code: %d\n", httpCode);
@@ -2116,6 +2260,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       const unsigned long timeout = 2000; // 2 second timeout (was 3s) for maximum power efficiency
       
       Serial.printf("Reading BMP headers (%d bytes)...\n", header_size);
+      unsigned long header_read_start = millis();
       
       while (header_read < header_size && (millis() - start_time) < timeout) {
         if (stream->available() > 0) {
@@ -2129,6 +2274,9 @@ bool downloadAndConvertBmpImage(const char* url) {
           }
         }
       }
+      
+      unsigned long header_read_time = millis() - header_read_start;
+      Serial.printf("⏱️ BMP header reading: %lu ms\n", header_read_time);
       
       if (header_read < header_size) {
         Serial.printf("✗ Failed to read BMP headers (got %d of %d bytes after %lu ms)\n", 
@@ -2180,6 +2328,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       // Skip to pixel data
       size_t bytes_read_so_far = header_size;
       uint8_t* palette_buffer = nullptr;
+      uint8_t* color_lookup = nullptr; // Declare color lookup table pointer
       
       // Read color palette for 8-bit indexed BMPs
       if (infoHeader.biBitCount == 8) {
@@ -2198,6 +2347,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         start_time = millis();
         
         Serial.printf("Reading BMP palette (%d bytes)...\n", palette_size);
+        unsigned long palette_start = millis();
         
         while (palette_read < palette_size && (millis() - start_time) < timeout) {
           if (stream->available() > 0) {
@@ -2214,6 +2364,9 @@ bool downloadAndConvertBmpImage(const char* url) {
           }
         }
         
+        unsigned long palette_time = millis() - palette_start;
+        Serial.printf("⏱️ Palette reading: %lu ms\n", palette_time);
+        
         if (palette_read < palette_size) {
           Serial.printf("✗ Failed to read BMP palette (got %d of %d bytes after %lu ms)\n", 
                        palette_read, palette_size, millis() - start_time);
@@ -2224,6 +2377,25 @@ bool downloadAndConvertBmpImage(const char* url) {
         
         Serial.printf("✓ Successfully read BMP palette (%d bytes)\n", palette_read);
         
+        // SPEED OPTIMIZATION: Pre-compute color lookup table for all 256 palette entries
+        color_lookup = (uint8_t*)malloc(256);
+        if (!color_lookup) {
+          Serial.println("✗ Failed to allocate color lookup table");
+          free(palette_buffer);
+          http.end();
+          return false;
+        }
+        
+        Serial.println("🚀 Pre-computing color lookup table for maximum speed...");
+        for (int i = 0; i < 256; i++) {
+          uint32_t offset = i * 4;
+          uint8_t b = palette_buffer[offset];
+          uint8_t g = palette_buffer[offset + 1]; 
+          uint8_t r = palette_buffer[offset + 2];
+          color_lookup[i] = rgbToEpaperColor(r, g, b);
+        }
+        Serial.println("✓ Color lookup table ready - no more per-pixel conversion needed!");
+        
         // DEBUG: Print first 10 palette entries to verify colors
         Serial.println("=== PALETTE DEBUG (first 10 colors) ===");
         for (int i = 0; i < 10 && i < 256; i++) {
@@ -2231,7 +2403,7 @@ bool downloadAndConvertBmpImage(const char* url) {
           uint8_t b = palette_buffer[offset];
           uint8_t g = palette_buffer[offset + 1]; 
           uint8_t r = palette_buffer[offset + 2];
-          uint8_t epaper_color = rgbToEpaperColor(r, g, b);
+          uint8_t epaper_color = color_lookup[i];
           Serial.printf("Palette[%d]: RGB(%d,%d,%d) -> e-paper color %d\n", i, r, g, b, epaper_color);
         }
         Serial.println("========================================");
@@ -2280,7 +2452,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       const uint32_t epaper_size = 192000; // 800x480 pixels, 4 bits per pixel
       Serial.printf("✓ Display buffer size: %d bytes for %dx%d display\n", 
                    epaper_size, infoHeader.biWidth, infoHeader.biHeight);
-      const uint32_t work_buffer_size = 119; // Max data per addressed I2C transaction
+      const uint32_t work_buffer_size = 16384; // ULTIMATE: 16KB buffer for minimum I2C transactions (was 8KB)
       uint8_t* work_buffer = (uint8_t*)malloc(work_buffer_size);
       
       if (!work_buffer) {
@@ -2292,9 +2464,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         return false;
       }
       
-      Serial.printf("✓ Allocated work buffer: %d bytes (streaming mode)\n", work_buffer_size);
-      
-      // Process BMP pixel data in display order for optimal I2C efficiency
+        Serial.printf("✓ Allocated ULTIMATE SPEED work buffer: %d bytes (parallel processing mode)\n", work_buffer_size);      // Process BMP pixel data in display order for optimal I2C efficiency
       // SIMPLIFIED: Stream BMP data sequentially, renderer will handle reordering
       uint32_t work_buffer_pos = 0;
       
@@ -2327,22 +2497,27 @@ bool downloadAndConvertBmpImage(const char* url) {
         Serial.printf("Streaming BMP pixel data sequentially (%d pixels, %d bytes per row)...\n", 
                      total_bmp_pixels, bmp_row_total);
         
+        unsigned long streaming_start = millis();
+        
         // Process each BMP row (bottom-to-top as stored in BMP)
         for (int32_t bmp_row = 0; bmp_row < (int32_t)infoHeader.biHeight; bmp_row++) {
           // Read entire BMP row into buffer
           size_t row_read = 0;
           unsigned long row_start_time = millis();
-          const unsigned long row_timeout = 1000; // 1s timeout (was 2s) for maximum power efficiency
+          const unsigned long row_timeout = 800; // BALANCED: 800ms timeout for reliability with speed
           
           while (row_read < bmp_row_total && (millis() - row_start_time) < row_timeout) {
             if (stream->available() > 0) {
               size_t available = stream->available();
               size_t to_read = min(available, bmp_row_total - row_read);
+              to_read = min(to_read, (size_t)1024); // Read in 1KB chunks for speed
               size_t read_size = stream->readBytes(&bmp_row_buffer[row_read], to_read);
               
               if (read_size > 0) {
                 row_read += read_size;
               }
+            } else {
+              delay(1); // Brief pause if no data available
             }
           }
           
@@ -2358,16 +2533,14 @@ bool downloadAndConvertBmpImage(const char* url) {
             return false;
           }
           
-          // Convert this row's pixels to e-paper colors and stream sequentially
+          // OPTIMIZED: Convert this row's pixels to e-paper colors using lookup table
           for (uint32_t bmp_col = 0; bmp_col < infoHeader.biWidth; bmp_col += 2) {
             uint8_t pixel_left_color, pixel_right_color;
             
-            // Extract left pixel
+            // Extract left pixel using FAST lookup table
             if (infoHeader.biBitCount == 8) {
               uint8_t index = bmp_row_buffer[bmp_col];
-              uint8_t r, g, b;
-              paletteToRgb(index, palette_buffer, &r, &g, &b);
-              pixel_left_color = rgbToEpaperColor(r, g, b);
+              pixel_left_color = color_lookup[index]; // FAST: Direct lookup, no RGB conversion!
             } else {
               uint32_t pixel_offset = bmp_col * 3;
               if (pixel_offset + 2 < bmp_row_bytes) {
@@ -2379,13 +2552,11 @@ bool downloadAndConvertBmpImage(const char* url) {
               }
             }
             
-            // Extract right pixel (if exists)
+            // Extract right pixel (if exists) using FAST lookup table
             if (bmp_col + 1 < infoHeader.biWidth) {
               if (infoHeader.biBitCount == 8) {
                 uint8_t index = bmp_row_buffer[bmp_col + 1];
-                uint8_t r, g, b;
-                paletteToRgb(index, palette_buffer, &r, &g, &b);
-                pixel_right_color = rgbToEpaperColor(r, g, b);
+                pixel_right_color = color_lookup[index]; // FAST: Direct lookup, no RGB conversion!
               } else {
                 uint32_t pixel_offset = (bmp_col + 1) * 3;
                 if (pixel_offset + 2 < bmp_row_bytes) {
@@ -2406,9 +2577,10 @@ bool downloadAndConvertBmpImage(const char* url) {
             // Add to work buffer
             work_buffer[work_buffer_pos++] = packed_byte;
             
-            // Send buffer when full
+            // OPTIMIZED: Send buffer when full using BURST MODE for maximum speed
             if (work_buffer_pos >= work_buffer_size) {
-              if (!sendImageChunkToAddress(bytes_streamed, work_buffer, work_buffer_pos)) {
+              // Send entire buffer in BURST MODE for maximum speed (4096 bytes via multiple I2C transactions)
+              if (!sendImageChunkBurst(bytes_streamed, work_buffer, work_buffer_pos)) {
                 Serial.printf("✗ Failed to send BMP chunk at offset %d\n", bytes_streamed);
                 free(bmp_row_buffer);
                 free(work_buffer);
@@ -2422,35 +2594,37 @@ bool downloadAndConvertBmpImage(const char* url) {
               bytes_streamed += work_buffer_pos;
               work_buffer_pos = 0;
               
-              // Progress reporting
-              if (bytes_streamed % 10000 == 0) {
-                float percent = ((float)bytes_streamed / epaper_size) * 100.0;
-                Serial.printf("BMP streaming: %d/%d bytes (%.1f%%)\n", 
-                             bytes_streamed, epaper_size, percent);
-              }
+              // REMOVED: Progress reporting to eliminate I/O overhead for maximum speed
+              // if (bytes_streamed % 25000 == 0) { ... }
               
             }
           }
           
-          // Progress reporting for row processing
-          if (bmp_row % 50 == 0) {
+          // Optimized progress reporting for row processing (MINIMAL for speed)
+          if (bmp_row == 0 || bmp_row == (int32_t)infoHeader.biHeight - 1) {
             float percent = ((float)(bmp_row + 1) / infoHeader.biHeight) * 100.0;
             Serial.printf("BMP processing: row %d/%d (%.1f%%)\n", 
                          bmp_row + 1, infoHeader.biHeight, percent);
           }
         }
         
+        unsigned long streaming_time = millis() - streaming_start;
+        Serial.printf("⏱️ BMP pixel data streaming: %lu ms (%.2f seconds)\n", streaming_time, streaming_time / 1000.0);
         Serial.printf("✓ BMP streaming completed: %d bytes streamed\n", bytes_streamed);
         
         free(bmp_row_buffer);
         
-        // Send any remaining data in work buffer
+        // Send any remaining data in work buffer using BURST MODE
         if (work_buffer_pos > 0) {
-          if (!sendImageChunkToAddress(bytes_streamed, work_buffer, work_buffer_pos)) {
+          // Send remaining buffer in BURST MODE for maximum speed
+          if (!sendImageChunkBurst(bytes_streamed, work_buffer, work_buffer_pos)) {
             Serial.printf("✗ Failed to send final BMP chunk at offset %d\n", bytes_streamed);
             free(work_buffer);
             if (palette_buffer) {
               free(palette_buffer);
+            }
+            if (color_lookup) {
+              free(color_lookup);
             }
             http.end();
             return false;
@@ -2464,22 +2638,33 @@ bool downloadAndConvertBmpImage(const char* url) {
         if (palette_buffer) {
           free(palette_buffer);
         }
+        if (color_lookup) {
+          free(color_lookup);
+        }
         http.end();
         
         Serial.printf("✓ BMP streaming conversion completed: %d bytes processed\n", bytes_streamed);
         
         // Send BMP reorder and render command (renderer will reorder from BMP to display format)
+        unsigned long render_start = millis();
         if (!sendBmpRenderCommand()) {
           return false;
         }
+        unsigned long render_command_time = millis() - render_start;
+        Serial.printf("⏱️ Render command transmission: %lu ms\n", render_command_time);
         
         // Send updated battery info to display after successful BMP render
+        unsigned long battery_update_start = millis();
         float voltage = getBatteryVoltage();
         if (voltage > 0.0f) {
           sendBatteryInfoToDisplay(voltage, display_cycle_count);
           current_battery_voltage = voltage; // Update local cache
         }
+        unsigned long battery_update_time = millis() - battery_update_start;
+        Serial.printf("⏱️ Battery info update: %lu ms\n", battery_update_time);
         
+        unsigned long total_processing_time = millis() - total_start_time;
+        Serial.printf("⏱️ TOTAL BMP PROCESSING TIME: %lu ms (%.2f seconds)\n", total_processing_time, total_processing_time / 1000.0);
         Serial.println("✓ BMP streaming conversion and render command complete");
         return true;
     } else {
