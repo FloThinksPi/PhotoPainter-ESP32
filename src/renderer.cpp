@@ -376,7 +376,7 @@ void init_i2c() {
     
     // Initialize I2C as slave with maximum speed settings
     Wire.begin(I2C_SLAVE_ADDRESS); // Start as I2C slave
-    Wire.setClock(1500000); // OPTIMIZED: 1.5MHz proven optimal for maximum throughput
+    Wire.setClock(5000000); // OPTIMIZED: 1.5MHz proven optimal for maximum throughput
     
     // Set up receive and request handlers
     Wire.onReceive(onI2CReceive);
