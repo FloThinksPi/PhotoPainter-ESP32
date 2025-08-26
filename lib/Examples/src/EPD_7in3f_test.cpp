@@ -136,13 +136,14 @@ int EPD_7in3f_display(float vol)
 
 int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float vol, bool show_battery_info, float battery_voltage, uint32_t display_cycles)
 {
-    printf("e-Paper Init and Clear...\r\n");
+    printf("📺 INIT DEBUG: Starting e-Paper Init and Clear...\r\n");
     EPD_7IN3F_Init();
+    printf("📺 INIT DEBUG: EPD_7IN3F_Init() completed successfully\r\n");
 
     // Use the provided image_data buffer directly instead of allocating new memory
     UBYTE *Image = image_data;
     UDOUBLE Imagesize = ((EPD_7IN3F_WIDTH % 2 == 0)? (EPD_7IN3F_WIDTH / 2 ): (EPD_7IN3F_WIDTH / 2 + 1)) * EPD_7IN3F_HEIGHT;
-    printf("Using provided image buffer (%d bytes, expected %d bytes)\r\n", data_size, Imagesize);
+    printf("📺 INIT DEBUG: Using provided image buffer (%d bytes, expected %d bytes)\r\n", data_size, Imagesize);
     
     if (data_size != Imagesize) {
         printf("ERROR: Image size mismatch - received %d bytes, expected %d bytes\r\n", data_size, Imagesize);
@@ -165,33 +166,43 @@ int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float v
         char battery_text[128];
         
         // Non-linear Li-ion battery percentage calculation based on discharge curve
-        // Values above 3.9V = 100%, below 3.3V = 0%, with curve-matched interpolation
+        // Values above 4.0V = 100%, below 3.3V = 0%, with curve-matched interpolation
         int battery_percent;
+        printf("BATTERY DEBUG: Calculating percentage for %.3fV\r\n", battery_voltage);
+        
         if (battery_voltage >= 4.0f) {
-            battery_percent = 100; // Everything above 3.9V is 100%
+            battery_percent = 100; // Everything above 4.0V is 100% (full charge)
+            printf("BATTERY DEBUG: High voltage %.3fV -> 100%%\r\n", battery_voltage);
         } else if (battery_voltage <= 3.3f) {
             battery_percent = 0;   // Everything below 3.3V is 0%
+            printf("BATTERY DEBUG: Low voltage %.3fV -> 0%%\r\n", battery_voltage);
         } else {
             // Non-linear interpolation matching Li-ion discharge curve
             // Using piecewise linear approximation of the curve
             if (battery_voltage >= 3.8f) {
-                // 3.9V-3.8V: 100% to 75% (steep drop at high voltage)
+                // 4.0V-3.8V: 100% to 75% (steep drop at high voltage)
                 battery_percent = 75 + (int)((battery_voltage - 3.8f) / (4.0f - 3.8f) * 25.0f);
+                printf("BATTERY DEBUG: Range 3.8-4.0V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             } else if (battery_voltage >= 3.7f) {
                 // 3.8V-3.7V: 75% to 50% (moderate slope)
                 battery_percent = 50 + (int)((battery_voltage - 3.7f) / (3.8f - 3.7f) * 25.0f);
+                printf("BATTERY DEBUG: Range 3.7-3.8V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             } else if (battery_voltage >= 3.6f) {
                 // 3.7V-3.6V: 50% to 25% (moderate slope)
                 battery_percent = 25 + (int)((battery_voltage - 3.6f) / (3.7f - 3.6f) * 25.0f);
+                printf("BATTERY DEBUG: Range 3.6-3.7V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             } else if (battery_voltage >= 3.5f) {
                 // 3.6V-3.5V: 25% to 10% (getting steeper)
                 battery_percent = 10 + (int)((battery_voltage - 3.5f) / (3.6f - 3.5f) * 15.0f);
+                printf("BATTERY DEBUG: Range 3.5-3.6V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             } else if (battery_voltage >= 3.4f) {
                 // 3.5V-3.4V: 10% to 3% (steep drop)
                 battery_percent = 3 + (int)((battery_voltage - 3.4f) / (3.5f - 3.4f) * 7.0f);
+                printf("BATTERY DEBUG: Range 3.4-3.5V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             } else {
                 // 3.4V-3.3V: 3% to 0% (very steep drop near cutoff)
                 battery_percent = (int)((battery_voltage - 3.3f) / (3.4f - 3.3f) * 3.0f);
+                printf("BATTERY DEBUG: Range 3.3-3.4V: %.3fV -> %d%%\r\n", battery_voltage, battery_percent);
             }
         }
         
@@ -229,12 +240,13 @@ int EPD_7in3f_display_with_data(uint8_t* image_data, uint32_t data_size, float v
     }
     
     // Display the image data with any overlay
-    printf("Displaying image data (%d bytes)\r\n", data_size);
+    printf("📺 DISPLAY DEBUG: About to display image data (%d bytes)\r\n", data_size);
     
-    printf("EPD_Display\r\n");
+    printf("📺 STEP 1: Calling EPD_7IN3F_Display() function...\r\n");
     EPD_7IN3F_Display(Image);
+    printf("📺 STEP 2: EPD_7IN3F_Display() function completed!\r\n");
 
-    printf("Goto Sleep...\r\n\r\n");
+    printf("📺 STEP 3: Going to sleep...\r\n");
     EPD_7IN3F_Sleep();
     
     // Show voltage warning after display (optional)

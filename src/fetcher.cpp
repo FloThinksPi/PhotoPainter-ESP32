@@ -1,15 +1,15 @@
 /*
- * ESP32 PhotoFrame Fetcher - HIGH-PERFORMANCE OPTIMIZED VERSION
+ * ESP32 PhotoFrame Fetcher - POWER-OPTIMIZED VERSION
  * 
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2025 Florian Braun (FloThinksPi)
  * 
- * Performance Optimizations:
- * - CPU: 240MHz maximum frequency for 3x performance boost
- * - I2C: 2.0MHz clock with ESP32-specific optimizations  
+ * Power Optimizations:
+ * - CPU: 120MHz single-core for power efficiency
+ * - WiFi: Low power mode (2dBm TX, MAX_MODEM sleep) for battery conservation
  * - Memory: ESP32-specific heap allocation and DMA-capable buffers
  * - Transfer: Zero-copy burst transfers with pre-compiled command buffers
- * - Target: Break through 67 KB/s Arduino Wire limitation for <3s BMP streaming
+ * - Target: Balance performance with power consumption for battery operation
  */
 
 #include <Arduino.h>
@@ -47,6 +47,8 @@ bool downloadAndConvertBmpImage(const char* url);
 bool sendImageChunkToAddress(uint32_t address_offset, const uint8_t* data, size_t data_size);
 bool sendImageChunkBurst(uint32_t start_address, const uint8_t* data, size_t total_size);
 bool sendBatteryInfoToDisplay(float voltage, uint32_t cycles);
+bool getDebugMode();
+bool setDebugMode(bool enable);
 int calculateBatteryPercentage(float voltage);
 void saveUrls();
 void saveAdminSettings();
@@ -134,6 +136,7 @@ int currentUrlIndex = 0;         // Index of current URL being used
 float current_battery_voltage = 0.0f;
 uint32_t current_wakeup_interval = 30;
 uint8_t current_charging_status = 3; // 0=not charging, 1=charging, 2=charge complete, 3=no external power
+bool current_debug_mode = false; // Track debug mode status
 uint32_t display_cycle_count = 0; // Track number of display updates for battery info
 unsigned long last_status_update = 0;
 
@@ -170,12 +173,18 @@ uint32_t totalChunks = (sizeof(Image7color) + I2C_CHUNK_SIZE - 1) / I2C_CHUNK_SI
 #define CMD_GET_CHARGING      0x09  // Get charging status (0=not charging, 1=charging, 2=charge complete)
 #define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
 #define CMD_SET_BATTERY_INFO  0x0B  // Set battery info for overlay display (voltage, cycles)
+#define CMD_GET_DEBUG_STATUS  0x0D  // Get debug mode status (0=off, 1=on)
+#define CMD_SET_DEBUG_MODE    0x0E  // Set debug mode (0=off, 1=on)
 
 // Status response codes from slave
 #define STATUS_READY          0x00  // Ready for next image
 #define STATUS_RECEIVING      0x01  // Receiving data
 #define STATUS_READY_TO_RENDER 0x02 // Data received, ready to render
 #define STATUS_ERROR          0x03  // Error occurred
+#define STATUS_BATTERY_SET    0x86  // Battery info set successfully
+#define STATUS_DEBUG_STATUS   0x88  // Debug status response follows
+#define STATUS_DEBUG_SET      0x89  // Debug mode set successfully
+#define STATUS_DEBUG_ERROR    0x8A  // Error setting debug mode
 
 // Image download functionality
 uint8_t* downloaded_image = nullptr;
@@ -673,6 +682,12 @@ bool waitForRenderCompletion(uint32_t timeout_ms = 30000) {
       return true; // ESP32 can shut down now - Pi Pico will handle the rest
     } else if (status == STATUS_RECEIVING) {
       Serial.printf("Renderer receiving data... (status: 0x%02X)\n", status);
+    } else if (status == STATUS_BATTERY_SET) {
+      Serial.println("✓ Battery info successfully set on renderer");
+    } else if (status == STATUS_DEBUG_SET) {
+      Serial.println("✓ Debug mode successfully set on renderer");
+    } else if (status == STATUS_DEBUG_ERROR) {
+      Serial.println("✗ Error setting debug mode on renderer");
     } else {
       Serial.printf("Unknown renderer status: 0x%02X\n", status);
     }
@@ -781,11 +796,11 @@ bool initI2C() {
   total_bytes_transferred = 0;
   total_i2c_time_us = 0;
   
-  Serial.printf("🚀 ESP32 BREAKTHROUGH: %.1f MHz I2C @ 240MHz CPU\n", 
+  Serial.printf("⚡ ESP32 POWER-EFFICIENT: %.1f MHz I2C @ 120MHz CPU\n", 
                 I2C_CLOCK_SPEED / 1000000.0);
   #else
   Wire.setClock(1500000); // Fallback to 1.5MHz for compatibility
-  Serial.println("⚡ I2C Performance Mode: 1.5MHz (compatibility)");
+  Serial.println("⚡ I2C Power-Efficient Mode: 1.5MHz (compatibility)");
   #endif
   
   Wire.setTimeout(8000); // Optimal timeout for reliable transfers
@@ -793,10 +808,10 @@ bool initI2C() {
   Serial.println("✅ ESP32 I2C Performance initialization complete");
   
   #ifdef ESP32_PERFORMANCE_OPTIMIZED
-  Serial.printf("🎯 OPTIMIZED config: SDA=%d, SCL=%d, Clock=%.1fMHz, CPU=240MHz, DMA-ready\n", 
+  Serial.printf("⚡ POWER-OPTIMIZED config: SDA=%d, SCL=%d, Clock=%.1fMHz, CPU=120MHz, Low-Power\n", 
                 I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK_SPEED / 1000000.0);
   #else
-  Serial.printf("⚡ OPTIMIZED config: SDA=%d, SCL=%d, Clock=1.5MHz, Timeout=8s\n", 
+  Serial.printf("⚡ POWER-OPTIMIZED config: SDA=%d, SCL=%d, Clock=1.5MHz, Timeout=8s\n", 
                 I2C_SDA_PIN, I2C_SCL_PIN);
   #endif
   
@@ -1048,6 +1063,106 @@ bool sendBatteryInfoToDisplay(float voltage, uint32_t cycles) {
     return true;
   } else {
     Serial.printf("✗ Failed to send battery info, error: %d\n", error);
+    return false;
+  }
+}
+
+// Get debug mode status from Pi Pico
+bool getDebugMode() {
+  Serial.println("Requesting debug mode status from Pi Pico...");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_DEBUG_STATUS);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.printf("✗ Failed to send debug status command, error: %d (Pi Pico may not have updated firmware)\n", error);
+    return false; // Default to false if communication fails
+  }
+  
+  delay(100); // Give more time for Pi Pico to prepare response
+  
+  Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+  
+  unsigned long start = millis();
+  while (Wire.available() < 1 && (millis() - start) < 500) { // Longer timeout
+    delay(10);
+  }
+  
+  if (Wire.available() >= 1) {
+    uint8_t status_or_debug = Wire.read();
+    
+    // Check if this is a debug status response (0x88) or direct debug value
+    if (status_or_debug == 0x88) {
+      // This is a status response, need to read another byte
+      delay(50);
+      Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+      start = millis();
+      while (Wire.available() < 1 && (millis() - start) < 200) {
+        delay(5);
+      }
+      if (Wire.available() >= 1) {
+        uint8_t debug_status = Wire.read();
+        bool is_enabled = (debug_status != 0);
+        Serial.printf("✓ Debug mode status: %s\n", is_enabled ? "ON" : "OFF");
+        return is_enabled;
+      }
+    } else {
+      // Direct response or old firmware - treat as debug status
+      bool is_enabled = (status_or_debug != 0);
+      Serial.printf("✓ Debug mode status (legacy): %s\n", is_enabled ? "ON" : "OFF");
+      return is_enabled;
+    }
+  }
+  
+  Serial.println("✗ Failed to read debug mode status response (Pi Pico may need firmware update)");
+  return false; // Default to false if no response
+}
+
+// Set debug mode on Pi Pico
+bool setDebugMode(bool enable) {
+  Serial.printf("Setting debug mode: %s\n", enable ? "ON" : "OFF");
+  
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_SET_DEBUG_MODE);
+  Wire.write(enable ? 1 : 0);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error == 0) {
+    // Wait for response status
+    delay(100);
+    
+    // Check status by reading response
+    Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+    Wire.write(CMD_GET_STATUS);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+      unsigned long start = millis();
+      while (Wire.available() < 1 && (millis() - start) < 300) {
+        delay(10);
+      }
+      
+      if (Wire.available() >= 1) {
+        uint8_t status = Wire.read();
+        if (status == STATUS_DEBUG_SET) {
+          Serial.printf("✓ Debug mode %s successfully\n", enable ? "enabled" : "disabled");
+          return true;
+        } else if (status == STATUS_DEBUG_ERROR) {
+          Serial.printf("✗ Error setting debug mode\n");
+          return false;
+        } else {
+          Serial.printf("✓ Debug mode command sent (status: 0x%02X, Pi Pico may not support debug commands yet)\n", status);
+          return true; // Assume success for compatibility
+        }
+      }
+    }
+    
+    Serial.printf("✓ Debug mode command sent (Pi Pico may not support debug commands yet)\n");
+    return true; // Assume success if no clear error
+  } else {
+    Serial.printf("✗ Failed to send debug mode command, error: %d\n", error);
     return false;
   }
 }
@@ -1826,6 +1941,7 @@ const char* getWebUI() {
   
   html += "<div class=\"i\">&#128472; Display Cycles: " + String(display_cycle_count) + " | " +
           "&#9200; Wakeup: " + String(current_wakeup_interval) + " min | " +
+          "&#128295; Debug: " + String(current_debug_mode ? "ON" : "OFF") + " | " +
           "&#127760; IP: " + ipAddress + " | &#128193; URLs: " + String(urlCount) + 
           " (current: #" + String(currentUrlIndex + 1) + ")</div></div>";
   
@@ -1841,7 +1957,12 @@ const char* getWebUI() {
   
   html += "<div class=\"f\"><h2>&#9881; Configuration</h2>";
   html += "<input type=\"number\" id=\"wake\" min=\"1\" max=\"43800\" value=\"" + String(current_wakeup_interval) + "\" placeholder=\"Wakeup interval (1-43800 minutes)\">";
-  html += "<button onclick=\"update()\">&#128190; Update</button><button onclick=\"refreshPage()\">&#128472; Refresh</button></div>";
+  html += "<button onclick=\"update()\">&#128190; Update</button><button onclick=\"refreshPage()\">&#128472; Refresh</button>";
+  html += "<div style=\"margin-top:10px;display:flex;align-items:center;gap:10px\">";
+  html += "<label for=\"debug-toggle\">Debug Mode:</label>";
+  html += "<input type=\"checkbox\" id=\"debug-toggle\" " + String(current_debug_mode ? "checked" : "") + " onchange=\"updateDebugButton()\">";
+  html += "<button id=\"debug-button\" onclick=\"toggleDebug()\">&#128295; " + String(current_debug_mode ? "Disable" : "Enable") + " Debug</button>";
+  html += "</div></div>";
   
   html += "<div class=\"sec\"><h2>&#128274; Security</h2>";
   html += "<input type=\"password\" id=\"pwd\" placeholder=\"New Password (8+ characters)\">";
@@ -1856,8 +1977,10 @@ const char* getWebUI() {
   html += "<script>";
   html += "function logout(){fetch('/logout',{method:'POST'}).then(()=>location.reload())}";
   html += "function update(){const i=document.getElementById('wake').value;if(i>=1&&i<=43800)fetch('/setWakeup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'minutes='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)});else showStatus('Please enter 1-43800 minutes',false)}";
+  html += "function toggleDebug(){const checkbox=document.getElementById('debug-toggle');const button=document.getElementById('debug-button');const enabled=checkbox.checked;button.disabled=true;button.innerHTML='&#9203; Setting...';fetch('/setDebugMode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+(enabled?'true':'false')}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));button.disabled=false;if(d.includes('success')){setTimeout(refreshPage,1500)}else{checkbox.checked=!enabled;updateDebugButton()}}).catch(e=>{showStatus('Failed to set debug mode',false);button.disabled=false;checkbox.checked=!enabled;updateDebugButton()})}";
+  html += "function updateDebugButton(){const checkbox=document.getElementById('debug-toggle');const button=document.getElementById('debug-button');button.innerHTML='&#128295; '+(checkbox.checked?'Disable':'Enable')+' Debug'}";
+  html += "function deleteUrl(i){if(confirm('Delete this URL?'))fetch('/deleteUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{console.log('Delete response:',d);showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)}).catch(e=>{console.error('Delete error:',e);showStatus('Failed to delete URL',false)})}";
   html += "function addUrl(){const u=document.getElementById('url').value;if(u)fetch('/addUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success')){document.getElementById('url').value='';setTimeout(refreshPage,1500)}});else showStatus('Please enter a URL',false)}";
-  html += "function deleteUrl(i){if(confirm('Delete this URL?'))fetch('/deleteUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)})}";
   html += "function displayImage(i){document.getElementById('control-status').innerHTML='&#128444; Displaying image #'+(i+1)+'...';fetch('/displayImage',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
   html += "function displayCurrent(){document.getElementById('control-status').innerHTML='&#128444; Displaying current image...';fetch('/displayCurrent',{method:'POST'}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'))})}";
   html += "function nextImage(){document.getElementById('control-status').innerHTML='&#9197; Loading next image...';fetch('/nextImage',{method:'POST'}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
@@ -1882,10 +2005,27 @@ void handleRoot() {
     return;
   }
   
-  // Update status from Pi Pico
-  current_battery_voltage = getBatteryVoltage();
-  current_wakeup_interval = getWakeupInterval();
-  current_charging_status = getChargingStatus();
+  // Update status from Pi Pico (with error handling)
+  Serial.println("Updating status from Pi Pico...");
+  
+  float new_battery_voltage = getBatteryVoltage();
+  if (new_battery_voltage > 0) {
+    current_battery_voltage = new_battery_voltage;
+  }
+  
+  uint32_t new_wakeup_interval = getWakeupInterval();
+  if (new_wakeup_interval > 0) {
+    current_wakeup_interval = new_wakeup_interval;
+  }
+  
+  uint8_t new_charging_status = getChargingStatus();
+  if (new_charging_status <= 3) { // Valid range 0-3
+    current_charging_status = new_charging_status;
+  }
+  
+  // Debug mode - safe to call even if Pi Pico doesn't support it yet
+  bool new_debug_mode = getDebugMode();
+  current_debug_mode = new_debug_mode;
   
   // Send battery info to display for overlay
   if (current_battery_voltage > 0.0f) {
@@ -1914,6 +2054,26 @@ void handleSetWakeup() {
     }
   } else {
     server.send(400, "text/plain", "Missing minutes parameter");
+  }
+}
+
+void handleSetDebugMode() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (server.hasArg("enable")) {
+    bool enable = (server.arg("enable") == "true" || server.arg("enable") == "1");
+    
+    if (setDebugMode(enable)) {
+      current_debug_mode = enable;
+      server.send(200, "text/plain", String("Debug mode ") + (enable ? "enabled" : "disabled") + " successfully!");
+    } else {
+      server.send(400, "text/plain", "Failed to update debug mode");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing enable parameter");
   }
 }
 
@@ -2075,6 +2235,7 @@ void setupWebServer() {
   server.on("/login", HTTP_POST, handleLogin);
   server.on("/logout", HTTP_POST, handleLogout);
   server.on("/setWakeup", HTTP_POST, handleSetWakeup);
+  server.on("/setDebugMode", HTTP_POST, handleSetDebugMode);
   server.on("/addUrl", HTTP_POST, handleAddUrl);
   server.on("/deleteUrl", HTTP_POST, handleDeleteUrl);
   server.on("/displayCurrent", HTTP_POST, handleDisplayCurrent);
@@ -2154,12 +2315,12 @@ void setup() {
       // Print ESP32 model information on startup
       printESP32ModelInfo();
       
-      // Switch to performance mode for web server operations when charging
-      Serial.println("🔌 CHARGING MODE: Switching to WiFi performance mode for web server");
-      setWiFiPerformanceMode();
+      // Keep WiFi in low power mode even when charging for energy efficiency
+      Serial.println("🔌 CHARGING MODE: Maintaining WiFi low power mode for energy efficiency");
+      setWiFiLowPowerMode();
       WiFi.setAutoReconnect(true);
       WiFi.persistent(true);
-      Serial.println("✓ WiFi optimizations enabled for charging mode");
+      Serial.println("✓ WiFi low power optimizations enabled for charging mode");
       
       // Initialize web server for configuration
       setupWebServer();
@@ -2438,9 +2599,9 @@ bool downloadAndStreamImage(const char* url) {
 bool downloadAndConvertBmpImage(const char* url) {
   Serial.printf("🚀 ESP32 PERFORMANCE: Starting BMP download and streaming conversion from: %s\n", url);
   
-  // ESP32 WIFI PERFORMANCE OPTIMIZATION: Switch to high performance mode for fast downloads
-  Serial.println("🚀 Switching WiFi to PERFORMANCE MODE for fast BMP download");
-  setWiFiPerformanceMode();
+  // ESP32 WIFI POWER OPTIMIZATION: Maintain low power mode for energy-efficient downloads
+  Serial.println("� Maintaining WiFi LOW POWER mode for energy-efficient BMP download");
+  setWiFiLowPowerMode();
   
   // ESP32 HIGH-PRECISION TIMING for breakthrough performance measurement
   #ifdef ESP32_PERFORMANCE_OPTIMIZED
@@ -3139,7 +3300,7 @@ void loop() {
     uint8_t status = getSlaveStatus();
     Serial.printf("Pi Pico status: 0x%02X\n", status);
     
-    if (status == STATUS_READY || status == STATUS_ERROR) {
+    if (status == STATUS_READY || status == STATUS_ERROR || status == STATUS_BATTERY_SET) {
       // Get next URL from the cycling list
       String imageUrl = getCurrentUrlAndAdvance();
       

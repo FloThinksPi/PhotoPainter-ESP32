@@ -146,8 +146,7 @@ Info:
 ******************************************************************************/
 UBYTE DEV_Module_Init(void)
 {
-    // Initialize EPD SPI
-    spi_init(EPD_SPI_PORT, 8000 * 1000);
+    spi_init(EPD_SPI_PORT, 20000 * 1000); // 20MHz SPI
     gpio_set_function(EPD_CLK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(EPD_MOSI_PIN, GPIO_FUNC_SPI);
 

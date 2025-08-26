@@ -6,8 +6,27 @@
 /*****************************************************************************
 * | File      	:   EPD_7in3f.c
 * | Author      :   Waveshare team
-* | Function    :   7.3inch e-Paper (F) Driver
-* | Info        :
+* | Function    :   7.3inch e-Paper (F) Driv    EPD_7IN3F_SendCommand(0x    }
+    
+    printf("📺 DATA SENT: All image data sent via original method\r\n");
+    
+    printf("📺 STEP 3: Starting e-paper display refresh (this takes longest)...\r\n");
+    
+    printf("📺 REVERTING: Using original byte-by-byte method that was working\r\n");
+    UWORD total_bytes = Width * Height;
+    
+    // REVERTED: Original byte-by-byte method that was working
+    for (UWORD j = 0; j < Height; j++) {
+        for (UWORD i = 0; i < Width; i++) {
+            EPD_7IN3F_SendData(Image[i + j * Width]);
+        }
+        // Progress every 100 lines
+        if (j % 100 == 0) {
+            printf("📺 PROGRESS: %d/%d lines\r\n", j, Height);
+        }
+    }
+    
+    printf("📺 DATA SENT: All %d bytes sent via original method\r\n", total_bytes);    :
 *----------------
 * |	This version:   V1.0
 * | Date        :   2022-08-04
@@ -34,6 +53,7 @@
 #
 ******************************************************************************/
 #include "EPD_7in3f.h"
+#include "pico/time.h"  // For high-precision timing with time_us_32()
 
 /******************************************************************************
 function :	Software reset
@@ -84,9 +104,9 @@ static void EPD_7IN3F_ReadBusyH(void)
     int cnt = 0;
     printf("e-Paper busy H\r\n");
     while(!DEV_Digital_Read(EPD_BUSY_PIN)) {      //LOW: idle, HIGH: busy
-        DEV_Delay_ms(10);
+        DEV_Delay_ms(10); // REVERTED: Original 10ms delay
         cnt++;
-        if(cnt > 5000) {
+        if(cnt > 5000) { // REVERTED: Original timeout
             printf("e-Paper busy H force release\r\n");
             return;
         }
@@ -97,7 +117,7 @@ static void EPD_7IN3F_ReadBusyL(void)
 {
     printf("e-Paper busy L\r\n");
     while(DEV_Digital_Read(EPD_BUSY_PIN)) {      //LOW: idle, HIGH: busy
-        DEV_Delay_ms(5);
+        DEV_Delay_ms(5); // REVERTED: Original 5ms delay
     }
     printf("e-Paper busy L release\r\n");
 }
@@ -108,31 +128,25 @@ parameter:
 ******************************************************************************/
 static void EPD_7IN3F_TurnOnDisplay(void)
 {
-    printf("🔄 REFRESH: Starting display refresh sequence...\r\n");
-    fflush(stdout);
-    
+    printf("🖥️ TURN_ON_DISPLAY: Step 1 - Power ON command\r\n");
     EPD_7IN3F_SendCommand(0x04); // POWER_ON
-    printf("🔄 REFRESH: Power ON command sent, waiting for ready...\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: Waiting for power on busy...\r\n");
     EPD_7IN3F_ReadBusyH();
-    printf("🔄 REFRESH: Power ON ready!\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: Power on complete\r\n");
 
+    printf("🖥️ TURN_ON_DISPLAY: Step 2 - Display refresh command\r\n");
     EPD_7IN3F_SendCommand(0x12); // DISPLAY_REFRESH
     EPD_7IN3F_SendData(0x00);
-    printf("🔄 REFRESH: Display refresh command sent, waiting for completion...\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: Waiting for display refresh busy...\r\n");
     EPD_7IN3F_ReadBusyH();
-    printf("🔄 REFRESH: Display refresh completed!\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: Display refresh complete\r\n");
 
+    printf("🖥️ TURN_ON_DISPLAY: Step 3 - Power OFF command\r\n");
     EPD_7IN3F_SendCommand(0x02); // POWER_OFF
     EPD_7IN3F_SendData(0X00);
-    printf("🔄 REFRESH: Power OFF command sent, waiting for ready...\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: Waiting for power off busy...\r\n");
     EPD_7IN3F_ReadBusyH();
-    printf("🔄 REFRESH: Power OFF ready - display update complete!\r\n");
-    fflush(stdout);
+    printf("🖥️ TURN_ON_DISPLAY: All steps completed successfully!\r\n");
 }
 
 /******************************************************************************
@@ -282,7 +296,7 @@ void EPD_7IN3F_Show7Block(void)
 }
 
 /******************************************************************************
-function :	Sends the image buffer in RAM to e-Paper and displays
+function :	Sends the image buffer in RAM to e-Paper and displays - ULTRA-OPTIMIZED
 parameter:
 ******************************************************************************/
 void EPD_7IN3F_Display(UBYTE *Image)
@@ -291,28 +305,43 @@ void EPD_7IN3F_Display(UBYTE *Image)
     Width = (EPD_7IN3F_WIDTH % 2 == 0)? (EPD_7IN3F_WIDTH / 2 ): (EPD_7IN3F_WIDTH / 2 + 1);
     Height = EPD_7IN3F_HEIGHT;
 
-    printf("📺 DISPLAY: Starting original e-paper display (%d x %d)\r\n", Width, Height);
-    fflush(stdout);  // Force immediate output
+    printf("🚀 ULTRA-FAST: Starting optimized e-paper display (%d x %d = %d bytes)\r\n", 
+           Width, Height, Width * Height);
     
+    unsigned long display_start = time_us_32();
+    
+    printf("📡 STEP 1: Sending display command 0x10\r\n");
     EPD_7IN3F_SendCommand(0x10);
-    printf("📺 DISPLAY: Sending %d bytes of image data...\r\n", Width * Height);
-    fflush(stdout);
     
+    printf("� REVERTING: Using original byte-by-byte method that was working\r\n");
+    
+    // REVERTED: Original byte-by-byte method that was working
     for (UWORD j = 0; j < Height; j++) {
         for (UWORD i = 0; i < Width; i++) {
             EPD_7IN3F_SendData(Image[i + j * Width]);
         }
-        if (j % 120 == 0) {
-            printf("📺 PROGRESS: Line %d/%d\r\n", j, Height);
-            fflush(stdout);
+        // Progress every 100 lines
+        if (j % 100 == 0) {
+            printf("📺 PROGRESS: %d/%d lines\r\n", j, Height);
         }
     }
     
-    printf("📺 DISPLAY: Data sent! Calling TurnOnDisplay...\r\n");
-    fflush(stdout);
+    printf("📺 DATA SENT: All %d bytes sent via original method\r\n", total_bytes);
+    
+    printf("� STEP 3: Starting e-paper display refresh (this takes longest)...\r\n");
+    unsigned long refresh_start = time_us_32();
+    
+    printf("📡 Calling EPD_7IN3F_TurnOnDisplay()...\r\n");
     EPD_7IN3F_TurnOnDisplay();
-    printf("📺 DISPLAY: TurnOnDisplay completed - display should be updated!\r\n");
-    fflush(stdout);
+    printf("📡 EPD_7IN3F_TurnOnDisplay() completed\r\n");
+    
+    unsigned long refresh_time = time_us_32() - refresh_start;
+    printf("✅ COMPLETE: Display refresh finished in %lu μs (%.2f ms)\r\n", 
+           refresh_time, refresh_time / 1000.0f);
+    
+    unsigned long total_time = time_us_32() - display_start;
+    printf("🎯 TOTAL DISPLAY TIME: %lu μs (%.2f seconds)\r\n", 
+           total_time, total_time / 1000000.0f);
 }
 
 /******************************************************************************

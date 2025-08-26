@@ -11,6 +11,7 @@
 #include "waveshare_PCF85063.h" // RTC
 #include "DEV_Config.h"
 #include "hardware/watchdog.h"
+#include "hardware/adc.h"  // For ADC functions
 
 #include <time.h>
 #include <cstring>
@@ -50,7 +51,7 @@ static unsigned long button_press_time = 0;
 static unsigned long last_button_state = 1; // 1 = not pressed (pull-up)
 static const unsigned long TRANSFER_TIMEOUT_MS = 60000; // 60 seconds
 static const unsigned long BUTTON_DEBOUNCE_MS = 100;    // Reduced for faster response
-static const unsigned long POST_RENDER_DELAY_MS = 200; // 200ms (was 2000ms) - minimum for I2C completion
+static const unsigned long POST_RENDER_DELAY_MS = 50; // 50ms - ULTRA-FAST completion for speed optimization
 
 // Power-aware watchdog management
 static bool watchdog_enabled = false;
@@ -78,6 +79,8 @@ static unsigned long RTC_WAKEUP_INTERVAL_MS; // Calculated from minutes
 #define CMD_SLEEP_NOW         0x0A  // Put renderer to sleep immediately
 #define CMD_SET_BATTERY_INFO  0x0B  // Set battery info for overlay display (voltage, cycles)
 #define CMD_GET_NEXT_IMAGE_REQUEST  0x0C  // Check if button was pressed to request next image
+#define CMD_GET_DEBUG_STATUS  0x0D  // Get debug mode status (0=off, 1=on)
+#define CMD_SET_DEBUG_MODE    0x0E  // Set debug mode (0=off, 1=on)
 
 // I2C Pin Configuration for Pi Pico (SLAVE) - ULTRA-OPTIMIZED
 #define I2C_SDA_PIN 4    // Pi Pico GPIO 4 (I2C0 SDA) -> ESP32 GPIO 21 (SDA)  
@@ -107,6 +110,9 @@ static bool battery_sampling_initialized = false;
 
 // Next image request tracking
 static bool next_image_requested = false;
+
+// Debug mode control
+static bool debug_mode_enabled = false;
 
 extern const char *fileList;
 extern char pathName[];
@@ -307,8 +313,9 @@ void onI2CReceive(int bytes) {
                     display_cycles |= ((uint32_t)Wire.read()) << 16;
                     display_cycles |= ((uint32_t)Wire.read()) << 24;  // MSB last
                     
-                    show_battery_overlay = true;
-                    Serial.printf("✓ Battery overlay info set: %.2fV, %lu cycles\n", battery_voltage, display_cycles);
+                    show_battery_overlay = true; // Always set when battery info is received
+                    Serial.printf("✓ Battery overlay info set: %.2fV, %lu cycles (will show if debug enabled)\n", 
+                                 battery_voltage, display_cycles);
                     status_response = 0x86; // Battery info set successfully
                 } else {
                     // Flush remaining bytes for malformed command
@@ -329,6 +336,30 @@ void onI2CReceive(int bytes) {
                     Serial.printf("✓ Next image request flag cleared and reported to ESP32\n");
                 } else {
                     status_response = 0x00; // No next image request
+                }
+                break;
+            }
+            
+            case CMD_GET_DEBUG_STATUS: {
+                // No additional data needed for this command
+                while (Wire.available()) Wire.read(); // Flush any remaining bytes
+                
+                // Response will be sent via onI2CRequest
+                status_response = 0x88; // Special status to indicate debug status response
+                Serial.printf("Debug status requested - current: %s\n", debug_mode_enabled ? "ON" : "OFF");
+                break;
+            }
+                
+            case CMD_SET_DEBUG_MODE: {
+                if (bytes >= 1) { // Need 1 byte for debug mode (0=off, 1=on)
+                    uint8_t new_debug_mode = Wire.read();
+                    debug_mode_enabled = (new_debug_mode != 0);
+                    Serial.printf("✓ Debug mode %s\n", debug_mode_enabled ? "enabled" : "disabled");
+                    status_response = 0x89; // Debug mode set successfully
+                } else {
+                    // Flush remaining bytes for malformed command
+                    while (Wire.available()) Wire.read();
+                    status_response = 0x8A; // Error response
                 }
                 break;
             }
@@ -363,6 +394,11 @@ void onI2CRequest() {
         // Sleep command acknowledged
         Wire.write(0x85);
         // Don't reset status - device will power off shortly
+    } else if (status_response == 0x88) {
+        // Send debug mode status as single byte
+        uint8_t debug_status = debug_mode_enabled ? 1 : 0;
+        Wire.write(debug_status);
+        status_response = 0; // Reset to ready status
     } else {
         // Send regular status response
         Wire.write(status_response);
@@ -684,12 +720,20 @@ void renderImage() {
         }
         
         // Call the display function with exactly 192,000 bytes and battery overlay info
-        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f, show_battery_overlay, battery_voltage, display_cycles);
+        Serial.printf("🚀 RENDERER: Starting ultra-optimized display rendering...\n");
+        unsigned long render_start_ms = millis();
+        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f, 
+                                                         show_battery_overlay && debug_mode_enabled, 
+                                                         battery_voltage, display_cycles);
+        unsigned long render_time_ms = millis() - render_start_ms;
+        
+        Serial.printf("⚡ RENDERER PERFORMANCE: Display completed in %lu ms (%.2f seconds)\n", 
+                     render_time_ms, render_time_ms / 1000.0f);
         
         if (display_result == 0) {
-            Serial.printf("✓ image displayed successfully! (%d bytes)\n", expected_size);
+            Serial.printf("✅ RENDERER SUCCESS: Ultra-fast image displayed! (%d bytes in %lu ms)\n", expected_size, render_time_ms);
         } else {
-            Serial.printf("⚠ Display function returned error %d, but continuing\n", display_result);
+            Serial.printf("⚠ Display function returned error %d, but completed in %lu ms\n", display_result, render_time_ms);
         }
     } else {
         Serial.printf("⚠ Image size too different from expected (%d vs %d), skipping display\n", 
@@ -737,8 +781,15 @@ float measureVBAT(void)
 
 // Initialize continuous battery sampling
 void initBatterySampling() {
+    // Initialize ADC for VSYS monitoring (channel 3 on Pico W)
+    adc_init();
+    adc_gpio_init(29);  // ADC3 - VSYS/3 input (battery voltage divider)
+    adc_select_input(3); // Select ADC3
+    
+    Serial.println("ADC initialized for battery voltage measurement (VSYS/3 via ADC3)");
+    
     // Initialize rolling buffer with current ADC reading
-    uint16_t initial_reading = adc_read();
+    uint16_t initial_reading = adc_read();  // Use SDK function directly
     for (int i = 0; i < 64; i++) {
         battery_sample_buffer[i] = initial_reading;
     }
@@ -746,7 +797,7 @@ void initBatterySampling() {
     battery_sampling_initialized = true;
     last_battery_sample = millis();
     
-    Serial.println("Battery sampling initialized with 64-sample rolling buffer");
+    Serial.printf("Battery sampling initialized with 64-sample rolling buffer (initial: 0x%03x)\n", initial_reading);
 }
 
 // Update battery voltage sampling (call regularly from main loop)
@@ -772,8 +823,10 @@ void updateBatterySampling() {
         uint16_t avg_result = total / 64;
         
         // Update cached voltage
-        const float conversion_factor = 3.3f / (1 << 12);
-        cached_battery_voltage = avg_result * conversion_factor * 3.0f;
+        // Pi Pico W: VSYS is divided by 3 before ADC3, ADC is 12-bit (4096 levels), 3.3V ref
+        const float conversion_factor = 3.3f / 4096.0f; // ADC to voltage
+        const float vsys_multiplier = 3.0f;             // Account for 3:1 voltage divider
+        cached_battery_voltage = avg_result * conversion_factor * vsys_multiplier;
         
         last_battery_sample = now;
         
