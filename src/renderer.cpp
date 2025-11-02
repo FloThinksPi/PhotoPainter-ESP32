@@ -29,6 +29,8 @@ void initPersistentStorage();
 uint32_t getCurrentSectorAddress();
 void saveWakeupIntervalWearLeveled(uint32_t minutes);
 uint32_t loadWakeupIntervalWearLeveled();
+void saveDebugModeWearLeveled(bool enabled);
+bool loadDebugModeWearLeveled();
 
 // EEPROM addresses for persistent settings with WEAR LEVELING
 #define EEPROM_SIZE 512          // Total EEPROM size to initialize
@@ -36,7 +38,8 @@ uint32_t loadWakeupIntervalWearLeveled();
 #define SECTOR_SIZE 32           // Each wear-leveling sector is 32 bytes
 #define MAGIC_OFFSET 0           // Magic number offset within sector
 #define WAKEUP_OFFSET 4          // Wakeup interval offset within sector
-#define CYCLE_OFFSET 8           // Write cycle counter offset within sector
+#define DEBUG_OFFSET 8           // Debug mode offset within sector
+#define CYCLE_OFFSET 12          // Write cycle counter offset within sector
 
 #define EEPROM_MAGIC_VALUE 0x12345678  // Magic number for validation
 
@@ -51,7 +54,7 @@ static unsigned long button_press_time = 0;
 static unsigned long last_button_state = 1; // 1 = not pressed (pull-up)
 static const unsigned long TRANSFER_TIMEOUT_MS = 60000; // 60 seconds
 static const unsigned long BUTTON_DEBOUNCE_MS = 100;    // Reduced for faster response
-static const unsigned long POST_RENDER_DELAY_MS = 50; // 50ms - ULTRA-FAST completion for speed optimization
+static const unsigned long POST_RENDER_DELAY_MS = 3000; // 3 seconds for ESP32 battery reading
 
 // Power-aware watchdog management
 static bool watchdog_enabled = false;
@@ -110,6 +113,9 @@ static bool battery_sampling_initialized = false;
 
 // Next image request tracking
 static bool next_image_requested = false;
+
+// RTC update flag
+static bool rtc_update_requested = false;
 
 // Debug mode control
 static bool debug_mode_enabled = false;
@@ -262,7 +268,11 @@ void onI2CReceive(int bytes) {
                         // SAVE TO PERSISTENT STORAGE
                         saveWakeupInterval(new_interval);
                         
+                        // Set flag to update RTC alarm later (outside I2C handler)
+                        rtc_update_requested = true;
+                        
                         Serial.printf("✓ RTC wakeup interval updated to %lu minutes and SAVED to EEPROM\n", RTC_WAKEUP_INTERVAL_MINUTES);
+                        Serial.printf("✓ RTC alarm will be reconfigured shortly\n");
                         status_response = 0x82; // Success response for set wakeup
                     } else {
                         Serial.printf("⚠ Invalid wakeup interval: %lu minutes (must be 1-43800)\n", new_interval);
@@ -353,8 +363,17 @@ void onI2CReceive(int bytes) {
             case CMD_SET_DEBUG_MODE: {
                 if (bytes >= 1) { // Need 1 byte for debug mode (0=off, 1=on)
                     uint8_t new_debug_mode = Wire.read();
-                    debug_mode_enabled = (new_debug_mode != 0);
-                    Serial.printf("✓ Debug mode %s\n", debug_mode_enabled ? "enabled" : "disabled");
+                    bool new_debug_enabled = (new_debug_mode != 0);
+                    
+                    // Only save if the mode actually changed
+                    if (new_debug_enabled != debug_mode_enabled) {
+                        debug_mode_enabled = new_debug_enabled;
+                        // Save using the wakeup interval function since they share the same data structure
+                        saveWakeupIntervalWearLeveled(RTC_WAKEUP_INTERVAL_MINUTES);
+                        Serial.printf("✓ Debug mode %s and saved to EEPROM\n", debug_mode_enabled ? "enabled" : "disabled");
+                    } else {
+                        Serial.printf("Debug mode already %s\n", debug_mode_enabled ? "enabled" : "disabled");
+                    }
                     status_response = 0x89; // Debug mode set successfully
                 } else {
                     // Flush remaining bytes for malformed command
@@ -486,9 +505,9 @@ bool detectButtonPress() {
 // Power-aware watchdog management functions
 void enablePowerAwareWatchdog() {
     if (!watchdog_enabled) {
-        watchdog_enable(1000, 1); // 1 second timeout with reset enabled
+        watchdog_enable(8000, 1); // 8 second timeout to allow for rendering operations
         watchdog_enabled = true;
-        Serial.printf("🔋 Watchdog ENABLED - battery mode timeout protection active\r\n");
+        Serial.printf("🔋 Watchdog ENABLED - battery mode timeout protection active (8s)\r\n");
     }
 }
 
@@ -720,21 +739,30 @@ void renderImage() {
         }
         
         // Call the display function with exactly 192,000 bytes and battery overlay info
-        Serial.printf("🚀 RENDERER: Starting ultra-optimized display rendering...\n");
+        if (debug_mode_enabled) {
+            Serial.printf("🚀 RENDERER: Starting ultra-optimized display rendering...\n");
+        }
         unsigned long render_start_ms = millis();
-        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, 3.3f, 
+        int display_result = EPD_7in3f_display_with_data(image_buffer, expected_size, battery_voltage, 
                                                          show_battery_overlay && debug_mode_enabled, 
                                                          battery_voltage, display_cycles);
         unsigned long render_time_ms = millis() - render_start_ms;
         
-        Serial.printf("⚡ RENDERER PERFORMANCE: Display completed in %lu ms (%.2f seconds)\n", 
-                     render_time_ms, render_time_ms / 1000.0f);
+        if (debug_mode_enabled) {
+            Serial.printf("⚡ RENDERER PERFORMANCE: Display completed in %lu ms (%.2f seconds)\n", 
+                         render_time_ms, render_time_ms / 1000.0f);
+        }
         
         if (display_result == 0) {
-            Serial.printf("✅ RENDERER SUCCESS: Ultra-fast image displayed! (%d bytes in %lu ms)\n", expected_size, render_time_ms);
+            if (debug_mode_enabled) {
+                Serial.printf("✅ RENDERER SUCCESS: Ultra-fast image displayed! (%d bytes in %lu ms)\n", expected_size, render_time_ms);
+            }
         } else {
             Serial.printf("⚠ Display function returned error %d, but completed in %lu ms\n", display_result, render_time_ms);
         }
+        
+        // Reset battery overlay flag after display is complete
+        show_battery_overlay = false;
     } else {
         Serial.printf("⚠ Image size too different from expected (%d vs %d), skipping display\n", 
                      received_bytes, expected_size);
@@ -747,16 +775,27 @@ void renderImage() {
     render_requested = false;
     render_was_completed = true; // Set the completion flag
     
-    // power-off in battery mode after MINIMAL delay
+    // power-off in battery mode after SUFFICIENT delay for ESP32 battery reading
     if (!DEV_Digital_Read(VBUS)) {
         Serial.printf("✓ Battery mode render complete - setting up next RTC wake-up\n");
         
         // Set up the next RTC wake-up alarm before powering off
         updateRTCWakeup();
         
-        Serial.printf("✓ Next RTC wake-up configured - powering off in %d ms\n", POST_RENDER_DELAY_MS);
-        DEV_Delay_ms(POST_RENDER_DELAY_MS); // MINIMAL delay (200ms) to ensure I2C completion
-        Serial.printf("powering off after successful render...\n");
+        Serial.printf("✓ Next RTC wake-up configured - staying awake for %.1f seconds for ESP32 battery reading\n", POST_RENDER_DELAY_MS / 1000.0);
+        
+        // Extended delay to allow ESP32 to read battery voltage and send battery info
+        // This prevents the renderer from sleeping before ESP32 can get the current voltage
+        unsigned long delay_start = millis();
+        while (millis() - delay_start < POST_RENDER_DELAY_MS) {
+            // Update watchdog during delay to prevent timeout
+            if (watchdog_enabled) {
+                watchdog_update();
+            }
+            DEV_Delay_ms(50); // Check every 50ms
+        }
+        
+        Serial.printf("powering off after successful render and battery reading delay...\n");
         powerOff();
     }
     
@@ -775,6 +814,13 @@ Mode 2: pic folder name is not automatically obtained, users need to create file
 
 float measureVBAT(void)
 {
+    // Ensure battery sampling has had time to stabilize
+    if (!battery_sampling_initialized || 
+        (millis() - last_battery_sample) > (BATTERY_SAMPLE_INTERVAL * 2)) {
+        // Force an immediate battery sample update if cache is stale
+        updateBatterySampling();
+    }
+    
     // Return cached value for instant I2C response
     return cached_battery_voltage;
 }
@@ -939,10 +985,10 @@ void printPowerConfig() {
     Serial.printf("=== POWER MANAGEMENT CONFIGURATION ===\r\n");
     Serial.printf("RTC Wake-up Interval: %lu minutes\r\n", RTC_WAKEUP_INTERVAL_MINUTES);
     Serial.printf("Transfer Timeout: %lu seconds\r\n", TRANSFER_TIMEOUT_MS / 1000);
-    Serial.printf("Post-Render Delay: %lu ms  \r\n", POST_RENDER_DELAY_MS);
+    Serial.printf("Post-Render Delay: %lu ms (extended for ESP32 battery reading)\r\n", POST_RENDER_DELAY_MS);
     Serial.printf("Button Debounce: %lu ms\r\n", BUTTON_DEBOUNCE_MS);
     Serial.printf("Power-Aware Watchdog: ENABLED\r\n");
-    Serial.printf("  🔋 Battery Mode: 1000ms timeout active\r\n");
+    Serial.printf("  🔋 Battery Mode: 8000ms timeout for rendering operations\r\n");
     Serial.printf("  🔌 External Power: Watchdog disabled (unlimited time)\r\n");
     Serial.printf("  ⚡ Dynamic: Adapts to power changes in real-time\r\n");
     Serial.printf("=====================================\r\n");
@@ -968,7 +1014,10 @@ void initPersistentStorage() {
     
     // Load settings using wear-leveled approach
     RTC_WAKEUP_INTERVAL_MINUTES = loadWakeupIntervalWearLeveled();
+    Serial.printf("After EEPROM load: RTC_WAKEUP_INTERVAL_MINUTES=%lu, debug_mode_enabled=%s\r\n",
+                  RTC_WAKEUP_INTERVAL_MINUTES, debug_mode_enabled ? "true" : "false");
     Serial.printf("Loaded RTC wakeup interval with wear leveling: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
+    Serial.printf("Loaded debug mode from EEPROM: %s\n", debug_mode_enabled ? "enabled" : "disabled");
     
     // Calculate milliseconds from minutes
     RTC_WAKEUP_INTERVAL_MS = RTC_WAKEUP_INTERVAL_MINUTES * 60 * 1000;
@@ -992,6 +1041,7 @@ void saveWakeupIntervalWearLeveled(uint32_t minutes) {
     // Write to wear-leveled sector
     EEPROM.put(sector_addr + MAGIC_OFFSET, EEPROM_MAGIC_VALUE);
     EEPROM.put(sector_addr + WAKEUP_OFFSET, minutes);
+    EEPROM.put(sector_addr + DEBUG_OFFSET, debug_mode_enabled ? 1 : 0);
     EEPROM.put(sector_addr + CYCLE_OFFSET, eeprom_write_cycle);
     EEPROM.commit();
     
@@ -1002,34 +1052,52 @@ void saveWakeupIntervalWearLeveled(uint32_t minutes) {
 uint32_t loadWakeupIntervalWearLeveled() {
     uint32_t highest_cycle = 0;
     uint32_t best_minutes = DEFAULT_WAKEUP_MINUTES;
+    bool best_debug_mode = false;
     bool found_valid = false;
+    
+    Serial.printf("Loading settings with wear leveling - scanning %d sectors...\n", WEAR_LEVELING_SECTORS);
     
     // Check all wear-leveling sectors to find the most recent valid data
     for (int sector = 0; sector < WEAR_LEVELING_SECTORS; sector++) {
         uint32_t sector_addr = sector * SECTOR_SIZE;
         
-        uint32_t magic, minutes, cycle;
+        uint32_t magic, minutes, debug_val, cycle;
         EEPROM.get(sector_addr + MAGIC_OFFSET, magic);
         EEPROM.get(sector_addr + WAKEUP_OFFSET, minutes);
+        EEPROM.get(sector_addr + DEBUG_OFFSET, debug_val);
         EEPROM.get(sector_addr + CYCLE_OFFSET, cycle);
         
-        // Check if this sector has valid data and is newer
-        if (magic == EEPROM_MAGIC_VALUE && cycle > highest_cycle) {
+        Serial.printf("Sector %d: magic=0x%08lx, minutes=%lu, debug=%lu, cycle=%lu\n", 
+                     sector, magic, minutes, debug_val, cycle);
+        
+        // Check if this sector has valid data and is newer (or equal for first write)
+        if (magic == EEPROM_MAGIC_VALUE && cycle >= highest_cycle) {
             // Validate wakeup interval
             if (minutes >= 1 && minutes <= 43800) {
                 highest_cycle = cycle;
                 best_minutes = minutes;
+                best_debug_mode = (debug_val != 0);
                 found_valid = true;
-                eeprom_write_cycle = cycle; // Update current cycle counter
                 
-                Serial.printf("Found valid wear-leveled data in sector %d: %lu minutes (cycle %lu)\n", 
-                              sector, minutes, cycle);
+                Serial.printf("✓ Valid data in sector %d: %lu minutes, debug=%s (cycle %lu)\n", 
+                              sector, minutes, best_debug_mode ? "on" : "off", cycle);
+            } else {
+                Serial.printf("✗ Invalid minutes in sector %d: %lu\n", sector, minutes);
             }
+        } else if (magic == EEPROM_MAGIC_VALUE) {
+            Serial.printf("✗ Older data in sector %d (cycle %lu < %lu)\n", sector, cycle, highest_cycle);
+        } else {
+            Serial.printf("✗ No valid magic in sector %d\n", sector);
         }
     }
     
-    if (!found_valid) {
-        Serial.println("No valid wear-leveled data found, using default");
+    if (found_valid) {
+        debug_mode_enabled = best_debug_mode; // Restore debug mode
+        eeprom_write_cycle = highest_cycle; // Ensure cycle counter is properly set
+    } else {
+        Serial.println("No valid wear-leveled data found, using defaults");
+        debug_mode_enabled = false; // Default debug mode off
+        eeprom_write_cycle = 0; // Start from 0 for first write
         // Initialize with wear leveling
         saveWakeupIntervalWearLeveled(DEFAULT_WAKEUP_MINUTES);
     }
@@ -1047,6 +1115,60 @@ uint32_t loadWakeupInterval() {
     return loadWakeupIntervalWearLeveled();
 }
 
+// Save debug mode with wear leveling
+void saveDebugModeWearLeveled(bool enabled) {
+    eeprom_write_cycle++; // Increment wear leveling counter
+    uint32_t sector_addr = getCurrentSectorAddress();
+    
+    Serial.printf("Saving debug mode with wear leveling: %s to sector %lu (cycle %lu)\n", 
+                  enabled ? "enabled" : "disabled", sector_addr / SECTOR_SIZE, eeprom_write_cycle);
+    
+    // Write to wear-leveled sector (preserve existing wakeup interval)
+    uint32_t current_wakeup = RTC_WAKEUP_INTERVAL_MINUTES;
+    EEPROM.put(sector_addr + MAGIC_OFFSET, EEPROM_MAGIC_VALUE);
+    EEPROM.put(sector_addr + WAKEUP_OFFSET, current_wakeup);
+    EEPROM.put(sector_addr + DEBUG_OFFSET, enabled ? 1 : 0);
+    EEPROM.put(sector_addr + CYCLE_OFFSET, eeprom_write_cycle);
+    EEPROM.commit();
+    
+    Serial.println("✓ Debug mode saved with wear leveling");
+}
+
+// Load debug mode with wear leveling
+bool loadDebugModeWearLeveled() {
+    uint32_t highest_cycle = 0;
+    bool best_debug_mode = false;
+    bool found_valid = false;
+    
+    // Check all wear-leveling sectors to find the most recent valid data
+    for (int sector = 0; sector < WEAR_LEVELING_SECTORS; sector++) {
+        uint32_t sector_addr = sector * SECTOR_SIZE;
+        
+        uint32_t magic, debug_val, cycle;
+        EEPROM.get(sector_addr + MAGIC_OFFSET, magic);
+        EEPROM.get(sector_addr + DEBUG_OFFSET, debug_val);
+        EEPROM.get(sector_addr + CYCLE_OFFSET, cycle);
+        
+        // Check if this sector has valid data and is newer (or equal for first write)
+        if (magic == EEPROM_MAGIC_VALUE && cycle >= highest_cycle) {
+            highest_cycle = cycle;
+            best_debug_mode = (debug_val != 0);
+            found_valid = true;
+            eeprom_write_cycle = cycle; // Update current cycle counter
+            
+            Serial.printf("Found valid debug mode in sector %d: %s (cycle %lu)\n", 
+                          sector, best_debug_mode ? "enabled" : "disabled", cycle);
+        }
+    }
+    
+    if (!found_valid) {
+        Serial.println("No valid debug mode data found, using default (disabled)");
+        best_debug_mode = false;
+    }
+    
+    return best_debug_mode;
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -1054,6 +1176,8 @@ void setup()
     
     Serial.printf("=== RENDERER STARTING ===\r\n");
     Serial.printf("MAXIMUM POWER EFFICIENCY MODE\r\n");
+    Serial.printf("Initial values: debug_mode_enabled=%s, eeprom_write_cycle=%lu\r\n", 
+                  debug_mode_enabled ? "true" : "false", eeprom_write_cycle);
     
     // Initialize persistent storage first (loads RTC wakeup interval)
     initPersistentStorage();
@@ -1091,9 +1215,9 @@ void setup()
         // Start with watchdog disabled for unlimited operation time
         watchdog_enabled = false;
     } else {
-        Serial.printf("🔋 Battery power detected at startup - watchdog enabled\r\n");
-        // Enable watchdog for battery protection
-        watchdog_enable(1000, 1);
+        Serial.printf("🔋 Battery power detected at startup - watchdog enabled (8s)\r\n");
+        // Enable watchdog for battery protection with extended timeout for rendering
+        watchdog_enable(8000, 1); // 8 second timeout for rendering operations
         watchdog_enabled = true;
     }
     
@@ -1133,6 +1257,14 @@ void loop()
     
     // Power-aware watchdog management - automatically handles external power changes
     updatePowerAwareWatchdog();
+    
+    // Handle RTC update request (from I2C wakeup interval change)
+    if (rtc_update_requested) {
+        Serial.printf("Updating RTC alarm for new interval: %lu minutes\n", RTC_WAKEUP_INTERVAL_MINUTES);
+        setupRTCWakeup();
+        rtc_update_requested = false;
+        Serial.printf("✓ RTC alarm reconfigured for new %lu minute interval\n", RTC_WAKEUP_INTERVAL_MINUTES);
+    }
     
     // Follow the EXACT pattern from original PhotoPainter main()
     if (!DEV_Digital_Read(VBUS)) {

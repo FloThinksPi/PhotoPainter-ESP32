@@ -1,0 +1,80 @@
+alias: WhatsApp Image Processor for E-Paper Display
+description: Process images from WhatsApp and convert them to dithered BMP format
+triggers:
+  - event_type: new_whatsapp_message
+    event_data:
+      type: imageMessage
+    trigger: event
+conditions:
+  - condition: template
+    value_template: >-
+      {{ phone_number in whitelisted_numbers | map(attribute='phone_receive') | list }}
+  - condition: template
+    value_template: "{{ image_url != '' }}"
+  - condition: template
+    value_template: "{{ not trigger.event.data.key.fromMe }}"
+actions:
+  - action: system_log.write
+    data:
+      message: >-
+        WhatsApp Image Processor: Processing image from {{ sender_name }} ({{
+        phone_number }})
+      level: info
+  - service: whatsapp.send_message
+    data:
+      clientId: default
+      to: "{{ phone_send }}"
+      body: 
+        text: "📸 One moment, photo is processing..."
+  - data:
+      phone_number: "{{ phone_number }}"
+      image_url: "{{ image_url }}"
+      media_key: "{{ media_key }}"
+      phone_salt: "{{ phone_salt }}"
+      sender_name: "{{ configured_name if configured_name else sender_name }}"
+      display_date: "{{ current_date }}"
+      image_text: "{{ image_caption }}"
+    action: shell_command.whatsapp_image_processor
+  - service: whatsapp.send_message
+    data:
+      clientId: default
+      to: "{{ phone_send }}"
+      body: 
+        text: "✅ Photo is updated on the display!"
+  - action: system_log.write
+    data:
+      message: >-
+        WhatsApp Image Processor: Completed processing for {{ sender_name }} ({{
+        phone_number }})
+      level: info
+variables:
+  whitelisted_numbers:
+    - phone_receive: 123@s.whatsapp.net
+      phone_send: 123@s.whatsapp.net
+      name: Alice
+    - phone_receive: 123@lid
+      phone_send: 321@s.whatsapp.net
+      name: Bob
+  phone_salt: your_secret_salt_here_change_this_to_something_secure
+  phone_number: "{{ trigger.event.data.key.remoteJid }}"
+  phone_send: |-
+    {%- set phone = phone_number -%}
+    {%- for contact in whitelisted_numbers -%}
+      {%- if contact.phone_receive == phone -%}
+        {{ contact.phone_send }}
+      {%- endif -%}
+    {%- endfor -%}
+  image_url: "{{ trigger.event.data.message.imageMessage.url }}"
+  media_key: "{{ trigger.event.data.message.imageMessage.mediaKey }}"
+  sender_name: "{{ trigger.event.data.pushName | default('Unknown') }}"
+  image_caption: "{{ trigger.event.data.message.imageMessage.caption | default('') }}"
+  configured_name: |-
+    {%- set phone = phone_number -%}
+    {%- for contact in whitelisted_numbers -%}
+      {%- if contact.phone_receive == phone -%}
+        {{ contact.name }}
+      {%- endif -%}
+    {%- endfor -%}
+  current_date: "{{ now().strftime('%d.%m.%Y') }}"
+mode: queued
+max: 10

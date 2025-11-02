@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h> // For HTTPS support
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <ImageData.h>
@@ -22,6 +23,7 @@
 #include <WebServer.h> // For web UI
 #include <Preferences.h> // For persistent URL storage
 #include <Update.h> // For OTA firmware updates
+#include <DNSServer.h> // For captive portal support
 
 // ESP32 WiFi Power Management Includes
 #include <WiFi.h>
@@ -56,6 +58,15 @@ void initUrlStorage();
 void initBatteryData();
 void saveBatteryData();
 String getCurrentUrlAndAdvance();
+
+// Helper function to clean up HTTP client and WiFiClient
+void cleanupHttpClient(HTTPClient& http, WiFiClient* client) {
+  http.end();
+  if (client) {
+    delete client;
+    client = nullptr;
+  }
+}
 bool addUrl(const String& url);
 bool removeUrl(int index);
 
@@ -193,6 +204,9 @@ bool download_success = false;
 
 // Connection monitoring
 unsigned long lastI2CActivity = 0;
+
+// Auto-fetch state for battery mode management
+static bool auto_fetch_completed_in_battery_mode = false;
 
 // Authentication and security
 String adminPassword = "photoframe2024";  // Default password
@@ -709,10 +723,7 @@ void shutdownESP32() {
   
   // Give time for serial output to complete
   Serial.flush();
-  delay(100);
-  
-  // ESP32 WIFI SHUTDOWN: Use optimized shutdown mode for deep sleep
-  setWiFiShutdownMode();
+  delay(10);
   
   // Put ESP32 into deep sleep mode (lowest power consumption)
   // Note: ESP32 will stay in deep sleep until reset button is pressed
@@ -1860,6 +1871,134 @@ bool removeUrl(int index) {
   return true;
 }
 
+// Simplified WiFi Setup UI for AP mode
+const char* getWiFiSetupUI() {
+  static String html;
+  
+  html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>ESP32PhotoFrame WiFi Setup</title>";
+  html += "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<style>";
+  html += "body{font-family:Arial;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}";
+  html += ".container{background:white;padding:30px;border-radius:15px;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-width:500px;width:100%}";
+  html += "h1{color:#333;text-align:center;margin-bottom:10px;font-size:24px}";
+  html += ".subtitle{text-align:center;color:#666;margin-bottom:30px}";
+  html += ".status{background:#e3f2fd;border:1px solid #2196f3;padding:15px;border-radius:8px;margin-bottom:20px}";
+  html += ".status h3{margin:0 0 10px 0;color:#1976d2}";
+  html += "input[type=\"text\"],input[type=\"password\"]{width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box}";
+  html += "input:focus{outline:none;border-color:#4CAF50}";
+  html += ".btn{width:100%;padding:12px;background:#4CAF50;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin:10px 0}";
+  html += ".btn:hover{background:#45a049}.btn:disabled{background:#ccc;cursor:not-allowed}";
+  html += ".btn-secondary{background:#2196f3}.btn-secondary:hover{background:#1976d2}";
+  html += "#wifi-networks{background:#f9f9f9;border:1px solid #ddd;border-radius:5px;max-height:200px;overflow-y:auto;margin:10px 0}";
+  html += ".network-item{padding:12px;border-bottom:1px solid #eee;cursor:pointer;display:flex;justify-content:space-between;align-items:center}";
+  html += ".network-item:hover{background:#e8f5e8}.network-item:last-child{border-bottom:none}";
+  html += ".network-name{font-weight:bold}.network-info{color:#666;font-size:12px}";
+  html += ".message{padding:10px;border-radius:5px;margin:10px 0;display:none}";
+  html += ".message.success{background:#d4edda;border:1px solid #c3e6cb;color:#155724}";
+  html += ".message.error{background:#f8d7da;border:1px solid #f5c6cb;color:#721c24}";
+  html += ".hidden{display:none}";
+  html += ".instructions{background:#fff3e0;padding:15px;border-radius:8px;border-left:4px solid #FF9800;margin-bottom:20px}";
+  html += ".instructions h3{margin:0 0 10px 0;color:#F57C00}";
+  html += "</style></head><body>";
+  
+  html += "<div class=\"container\">";
+  html += "<h1>&#128246; WiFi Setup</h1>";
+  html += "<p class=\"subtitle\">ESP32PhotoFrame Configuration</p>";
+  
+  html += "<div class=\"status\">";
+  html += "<h3>&#128225; Access Point Active</h3>";
+  html += "<p><strong>Device IP:</strong> 192.168.0.1</p>";
+  html += "<p><strong>Connected Clients:</strong> " + String(WiFi.softAPgetStationNum()) + "</p>";
+  html += "<p><strong>Status:</strong> Ready for WiFi configuration</p>";
+  html += "</div>";
+  
+  html += "<div class=\"instructions\">";
+  html += "<h3>&#128295; Setup Instructions</h3>";
+  html += "<ol><li>Scan for available networks below</li>";
+  html += "<li>Click on your WiFi network name</li>";
+  html += "<li>Enter your WiFi password</li>";
+  html += "<li>Click Connect to save settings</li></ol>";
+  html += "</div>";
+  
+  html += "<button class=\"btn btn-secondary\" onclick=\"scanWifi()\" id=\"scan-btn\">";
+  html += "&#128269; Scan for WiFi Networks</button>";
+  
+  html += "<div id=\"wifi-networks\"></div>";
+  
+  html += "<div id=\"wifi-form\" class=\"hidden\">";
+  html += "<input type=\"text\" id=\"ssid\" placeholder=\"WiFi Network Name\" readonly>";
+  html += "<input type=\"password\" id=\"password\" placeholder=\"WiFi Password\">";
+  html += "<button class=\"btn\" onclick=\"connectWifi()\" id=\"connect-btn\">";
+  html += "&#128246; Connect to WiFi</button>";
+  html += "<button class=\"btn-secondary btn\" onclick=\"hideWifiForm()\">";
+  html += "&#10006; Cancel</button>";
+  html += "</div>";
+  
+  html += "<div id=\"message\" class=\"message\"></div>";
+  
+  html += "<div style=\"text-align:center;color:#666;margin-top:30px;font-size:12px;\">";
+  html += "ESP32PhotoFrame WiFi Configuration Portal</div>";
+  html += "</div>";
+  
+  // Add JavaScript
+  html += "<script>";
+  html += "function showMessage(text,isSuccess){";
+  html += "const msg=document.getElementById('message');";
+  html += "msg.textContent=text;";
+  html += "msg.className='message '+(isSuccess?'success':'error');";
+  html += "msg.style.display='block';";
+  html += "setTimeout(()=>{msg.style.display='none'},5000);}";
+  
+  html += "function scanWifi(){";
+  html += "const btn=document.getElementById('scan-btn');";
+  html += "const networks=document.getElementById('wifi-networks');";
+  html += "btn.disabled=true;btn.textContent='\\uD83D\\uDD0D Scanning...';";
+  html += "networks.innerHTML='<div style=\"padding:15px;text-align:center;\">Scanning for networks...</div>';";
+  html += "fetch('/scanWifi').then(r=>r.json()).then(data=>{";
+  html += "let html='';if(data.length===0){";
+  html += "html='<div style=\"padding:15px;text-align:center;color:#666;\">No networks found</div>';}else{";
+  html += "data.forEach(net=>{const strength=net.rssi>-60?'\\uD83D\\uDCF6':'\\uD83D\\uDCF6';";
+  html += "const security=net.encryption?'\\uD83D\\uDD12':'\\uD83D\\uDD13';";
+  html += "html+='<div class=\"network-item\" onclick=\"selectNetwork(\\''+net.ssid.replace(/'/g,\"\\\\\\\\'\")+'\\',' +net.encryption+')\"><div><div class=\"network-name\">'+net.ssid+'</div>';";
+  html += "html+='<div class=\"network-info\">'+net.rssi+' dBm \\u2022 '+(net.encryption?'Secured':'Open')+'</div></div>';";
+  html += "html+='<div>'+strength+' '+security+'</div></div>';});}";
+  html += "networks.innerHTML=html;}).catch(e=>{";
+  html += "networks.innerHTML='<div style=\"padding:15px;text-align:center;color:#d32f2f;\">Scan failed</div>';";
+  html += "showMessage('Network scan failed',false);}).finally(()=>{";
+  html += "btn.disabled=false;btn.textContent='\\uD83D\\uDD0D Scan for WiFi Networks';});}";
+  
+  html += "function selectNetwork(ssid,encrypted){";
+  html += "document.getElementById('ssid').value=ssid;";
+  html += "document.getElementById('password').value='';";
+  html += "document.getElementById('wifi-form').classList.remove('hidden');";
+  html += "if(!encrypted){document.getElementById('password').placeholder='No password required (open network)';}";
+  html += "else{document.getElementById('password').placeholder='WiFi Password';}";
+  html += "showMessage('Selected network: '+ssid,true);}";
+  
+  html += "function hideWifiForm(){document.getElementById('wifi-form').classList.add('hidden');}";
+  
+  html += "function connectWifi(){";
+  html += "const ssid=document.getElementById('ssid').value;";
+  html += "const password=document.getElementById('password').value;";
+  html += "const btn=document.getElementById('connect-btn');";
+  html += "if(!ssid){showMessage('Please select a network first',false);return;}";
+  html += "btn.disabled=true;btn.textContent='\\uD83D\\uDCF6 Connecting...';";
+  html += "showMessage('Attempting to connect...',true);";
+  html += "fetch('/connectWifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},";
+  html += "body:'ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password)})";
+  html += ".then(r=>r.text()).then(response=>{";
+  html += "if(response.includes('Connected')){showMessage(response,true);";
+  html += "setTimeout(()=>{showMessage('WiFi connected! Device will restart.',true);";
+  html += "setTimeout(()=>{window.location.reload();},3000);},2000);}else{showMessage(response,false);}";
+  html += "}).catch(e=>{showMessage('Connection failed',false);})";
+  html += ".finally(()=>{btn.disabled=false;btn.textContent='\\uD83D\\uDCF6 Connect to WiFi';});}";
+  
+  html += "setTimeout(()=>{scanWifi();},1000);";
+  html += "</script></body></html>";
+  
+  return html.c_str();
+}
+
 // HTML for the web UI
 const char* getWebUI() {
   static String html; // Use String instead of fixed buffer to avoid truncation
@@ -1912,6 +2051,10 @@ const char* getWebUI() {
   html += ".status-msg{padding:10px;margin:10px 0;border-radius:5px;font-weight:bold}";
   html += ".status-success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}";
   html += ".status-error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}";
+  html += ".refresh{background:#607D8B}";
+  html += ".wifi-network{padding:8px;border-bottom:1px solid #eee;cursor:pointer;transition:background 0.3s}";
+  html += ".wifi-network:hover{background:#e8f5e8}";
+  html += "#wifi-networks{background:#f9f9f9;border:1px solid #ddd;border-radius:5px;max-height:200px;overflow-y:auto;margin:10px 0}";
   html += "</style></head><body><div class=\"c\">";
   
   html += "<h1>&#128248; PhotoFrame Control Panel</h1><button class=\"logout\" onclick=\"logout()\">Logout</button>";
@@ -1945,6 +2088,30 @@ const char* getWebUI() {
           "&#127760; IP: " + ipAddress + " | &#128193; URLs: " + String(urlCount) + 
           " (current: #" + String(currentUrlIndex + 1) + ")</div></div>";
   
+  // Add WiFi configuration section if in AP mode
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    html += "<div class=\"card\"><h2>&#128246; WiFi Configuration</h2>";
+    html += "<div class=\"i\">&#128246; Current Mode: Access Point (AP)</div>";
+    html += "<div class=\"i\">&#128246; AP SSID: ESP32PhotoFrame</div>";
+    html += "<div class=\"i\">&#127760; AP IP: " + WiFi.softAPIP().toString() + "</div>";
+    html += "<button class=\"refresh\" onclick=\"scanWifi()\" id=\"scan-btn\">&#128250; Scan Networks</button>";
+    html += "<div id=\"wifi-networks\" style=\"margin-top:10px;\"></div>";
+    html += "<div id=\"wifi-form\" style=\"display:none;margin-top:10px;\">";
+    html += "<div class=\"f\">";
+    html += "<input type=\"text\" id=\"ssid\" placeholder=\"WiFi Network Name\" style=\"margin-bottom:10px;\">";
+    html += "<input type=\"password\" id=\"wifi-password\" placeholder=\"WiFi Password\" style=\"margin-bottom:10px;\">";
+    html += "<button class=\"add\" onclick=\"connectWifi()\" id=\"connect-btn\">&#128246; Connect to WiFi</button>";
+    html += "<button class=\"del\" onclick=\"hideWifiForm()\">&#10006; Cancel</button>";
+    html += "</div></div>";
+    html += "<div id=\"wifi-status\"></div></div>";
+  } else if (WiFi.status() == WL_CONNECTED) {
+    html += "<div class=\"card\"><h2>&#128246; WiFi Status</h2>";
+    html += "<div class=\"i\">&#9989; Connected to: " + WiFi.SSID() + "</div>";
+    html += "<div class=\"i\">&#127760; IP Address: " + WiFi.localIP().toString() + "</div>";
+    html += "<div class=\"i\">&#128246; Signal Strength: " + String(WiFi.RSSI()) + " dBm</div>";
+    html += "</div>";
+  }
+  
   html += "<div class=\"control-section\"><h2>&#127918; Manual Controls</h2>";
   html += "<button class=\"display\" onclick=\"displayCurrent()\">&#128444; Display Current Image</button>";
   html += "<button class=\"next\" onclick=\"nextImage()\">&#9197; Next Image</button>";
@@ -1959,9 +2126,8 @@ const char* getWebUI() {
   html += "<input type=\"number\" id=\"wake\" min=\"1\" max=\"43800\" value=\"" + String(current_wakeup_interval) + "\" placeholder=\"Wakeup interval (1-43800 minutes)\">";
   html += "<button onclick=\"update()\">&#128190; Update</button><button onclick=\"refreshPage()\">&#128472; Refresh</button>";
   html += "<div style=\"margin-top:10px;display:flex;align-items:center;gap:10px\">";
-  html += "<label for=\"debug-toggle\">Debug Mode:</label>";
-  html += "<input type=\"checkbox\" id=\"debug-toggle\" " + String(current_debug_mode ? "checked" : "") + " onchange=\"updateDebugButton()\">";
-  html += "<button id=\"debug-button\" onclick=\"toggleDebug()\">&#128295; " + String(current_debug_mode ? "Disable" : "Enable") + " Debug</button>";
+  html += "<input type=\"checkbox\" id=\"debug-toggle\" " + String(current_debug_mode ? "checked" : "") + " onchange=\"toggleDebugMode()\">";
+  html += "<label for=\"debug-toggle\">Debug Mode</label>";
   html += "</div></div>";
   
   html += "<div class=\"sec\"><h2>&#128274; Security</h2>";
@@ -1977,8 +2143,8 @@ const char* getWebUI() {
   html += "<script>";
   html += "function logout(){fetch('/logout',{method:'POST'}).then(()=>location.reload())}";
   html += "function update(){const i=document.getElementById('wake').value;if(i>=1&&i<=43800)fetch('/setWakeup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'minutes='+i}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)});else showStatus('Please enter 1-43800 minutes',false)}";
-  html += "function toggleDebug(){const checkbox=document.getElementById('debug-toggle');const button=document.getElementById('debug-button');const enabled=checkbox.checked;button.disabled=true;button.innerHTML='&#9203; Setting...';fetch('/setDebugMode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+(enabled?'true':'false')}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));button.disabled=false;if(d.includes('success')){setTimeout(refreshPage,1500)}else{checkbox.checked=!enabled;updateDebugButton()}}).catch(e=>{showStatus('Failed to set debug mode',false);button.disabled=false;checkbox.checked=!enabled;updateDebugButton()})}";
-  html += "function updateDebugButton(){const checkbox=document.getElementById('debug-toggle');const button=document.getElementById('debug-button');button.innerHTML='&#128295; '+(checkbox.checked?'Disable':'Enable')+' Debug'}";
+  html += "function toggleDebugMode(){const checkbox=document.getElementById('debug-toggle');const enabled=checkbox.checked;checkbox.disabled=true;fetch('/setDebugMode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+(enabled?'true':'false')}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));checkbox.disabled=false;if(!d.includes('success')){checkbox.checked=!enabled}}).catch(e=>{showStatus('Failed to set debug mode',false);checkbox.disabled=false;checkbox.checked=!enabled})}";
+  html += "function updateDebugButton(){}"; // Keep for compatibility but make it empty
   html += "function deleteUrl(i){if(confirm('Delete this URL?'))fetch('/deleteUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{console.log('Delete response:',d);showStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,1500)}).catch(e=>{console.error('Delete error:',e);showStatus('Failed to delete URL',false)})}";
   html += "function addUrl(){const u=document.getElementById('url').value;if(u)fetch('/addUrl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)}).then(r=>r.text()).then(d=>{showStatus(d,d.includes('success'));if(d.includes('success')){document.getElementById('url').value='';setTimeout(refreshPage,1500)}});else showStatus('Please enter a URL',false)}";
   html += "function displayImage(i){document.getElementById('control-status').innerHTML='&#128444; Displaying image #'+(i+1)+'...';fetch('/displayImage',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+i}).then(r=>r.text()).then(d=>{showControlStatus(d,d.includes('success'));if(d.includes('success'))setTimeout(refreshPage,2000)})}";
@@ -1990,6 +2156,12 @@ const char* getWebUI() {
   html += "function showStatus(msg,success){const div=document.createElement('div');div.className='status-msg '+(success?'status-success':'status-error');div.innerHTML=msg;document.body.appendChild(div);setTimeout(()=>div.remove(),4000)}";
   html += "function showControlStatus(msg,success){document.getElementById('control-status').innerHTML='<div class=\"status-msg '+(success?'status-success':'status-error')+'\">'+msg+'</div>';setTimeout(()=>document.getElementById('control-status').innerHTML='',4000)}";
   html += "function showUploadStatus(msg,isProgress){document.getElementById('upload-status').innerHTML='<div class=\"status-msg '+(isProgress?'status-success':'status-error')+'\">'+msg+'</div>'}";
+  html += "function showWifiStatus(msg,success){document.getElementById('wifi-status').innerHTML='<div class=\"status-msg '+(success?'status-success':'status-error')+'\">'+msg+'</div>';setTimeout(()=>document.getElementById('wifi-status').innerHTML='',success?8000:4000)}";
+  html += "function scanWifi(){document.getElementById('scan-btn').innerHTML='&#128250; Scanning...';document.getElementById('scan-btn').disabled=true;fetch('/scanWifi').then(r=>r.json()).then(networks=>{let html='<div style=\"background:#f9f9f9;border:1px solid #ddd;border-radius:5px;max-height:200px;overflow-y:auto;margin:10px 0;\">';networks.forEach((net,i)=>{const strength=net.rssi>-60?'&#128246;':net.rssi>-70?'&#128246;':'&#128246;';const security=net.encryption?'&#128274;':'&#128275;';html+=`<div style=\"padding:8px;border-bottom:1px solid #eee;cursor:pointer;\" onclick=\"selectNetwork('${net.ssid.replace(/'/g,\"\\\\\\\\'\")}',${net.encryption})\"><strong>${net.ssid}</strong> ${strength} ${security} (${net.rssi} dBm)</div>`});html+='</div>';html+='<button onclick=\"showWifiForm()\" style=\"background:#4CAF50;color:white;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;\">&#10133; Add Network Manually</button>';document.getElementById('wifi-networks').innerHTML=html;document.getElementById('scan-btn').innerHTML='&#128250; Scan Networks';document.getElementById('scan-btn').disabled=false}).catch(e=>{showWifiStatus('Scan failed',false);document.getElementById('scan-btn').innerHTML='&#128250; Scan Networks';document.getElementById('scan-btn').disabled=false})}";
+  html += "function selectNetwork(ssid,encrypted){document.getElementById('ssid').value=ssid;document.getElementById('wifi-form').style.display='block';if(!encrypted)document.getElementById('wifi-password').style.display='none';else document.getElementById('wifi-password').style.display='block'}";
+  html += "function showWifiForm(){document.getElementById('wifi-form').style.display='block';document.getElementById('ssid').value='';document.getElementById('wifi-password').value='';document.getElementById('wifi-password').style.display='block'}";
+  html += "function hideWifiForm(){document.getElementById('wifi-form').style.display='none'}";
+  html += "function connectWifi(){const ssid=document.getElementById('ssid').value;const pass=document.getElementById('wifi-password').value;if(!ssid){showWifiStatus('Please enter WiFi name',false);return}document.getElementById('connect-btn').innerHTML='&#128246; Connecting...';document.getElementById('connect-btn').disabled=true;fetch('/connectWifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`ssid=${encodeURIComponent(ssid)}&password=${encodeURIComponent(pass)}`}).then(r=>r.text()).then(d=>{showWifiStatus(d,d.includes('Connected'));if(d.includes('Connected')){setTimeout(()=>{showWifiStatus('Switching to WiFi mode... Please reconnect to new IP address',true);setTimeout(refreshPage,3000)},2000)}document.getElementById('connect-btn').innerHTML='&#128246; Connect to WiFi';document.getElementById('connect-btn').disabled=false}).catch(e=>{showWifiStatus('Connection failed',false);document.getElementById('connect-btn').innerHTML='&#128246; Connect to WiFi';document.getElementById('connect-btn').disabled=false})}";
   html += "</script></body></html>";
   
   // Debug: Check HTML length
@@ -2000,6 +2172,9 @@ const char* getWebUI() {
 
 // Web server handlers
 void handleRoot() {
+  Serial.println("📡 HTTP request received to /");
+  
+  // Check authentication and serve full UI (only when connected to WiFi)
   if (!checkAuthentication()) {
     server.send(200, "text/html; charset=utf-8", getLoginPage());
     return;
@@ -2024,8 +2199,33 @@ void handleRoot() {
   }
   
   // Debug mode - safe to call even if Pi Pico doesn't support it yet
-  bool new_debug_mode = getDebugMode();
-  current_debug_mode = new_debug_mode;
+  // Only update current_debug_mode if we get a valid response from Pi Pico
+  // to preserve user settings when Pi Pico doesn't support debug commands
+  Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
+  Wire.write(CMD_GET_DEBUG_STATUS);
+  uint8_t debug_error = Wire.endTransmission();
+  
+  if (debug_error == 0) {
+    // Only try to read if the command was sent successfully
+    delay(100);
+    Wire.requestFrom(PI_PICO_I2C_ADDRESS, 1);
+    unsigned long debug_start = millis();
+    while (Wire.available() < 1 && (millis() - debug_start) < 200) {
+      delay(10);
+    }
+    
+    if (Wire.available() >= 1) {
+      uint8_t debug_response = Wire.read();
+      if (debug_response == 0x88 || debug_response == 0 || debug_response == 1) {
+        // Valid response - update current_debug_mode
+        bool new_debug_mode = (debug_response == 1) || (debug_response == 0x88);
+        current_debug_mode = new_debug_mode;
+      }
+      // If invalid response, keep current_debug_mode as is
+    }
+    // If no response, keep current_debug_mode as is
+  }
+  // If command failed, keep current_debug_mode as is
   
   // Send battery info to display for overlay
   if (current_battery_voltage > 0.0f) {
@@ -2068,9 +2268,10 @@ void handleSetDebugMode() {
     
     if (setDebugMode(enable)) {
       current_debug_mode = enable;
-      server.send(200, "text/plain", String("Debug mode ") + (enable ? "enabled" : "disabled") + " successfully!");
+      String message = String("Debug mode ") + (enable ? "enabled" : "disabled") + " successfully!";
+      server.send(200, "text/plain", message);
     } else {
-      server.send(400, "text/plain", "Failed to update debug mode");
+      server.send(400, "text/plain", "Failed to set debug mode");
     }
   } else {
     server.send(400, "text/plain", "Missing enable parameter");
@@ -2226,14 +2427,139 @@ void handleNextImage() {
 }
 
 void handleNotFound() {
-  server.send(404, "text/plain", "Page not found");
+  String message = "Page not found\n";
+  message += "URI: " + server.uri() + "\n";
+  message += "Method: " + String(server.method()) + "\n";
+  message += "Arguments: " + String(server.args()) + "\n";
+  message += "\nAvailable endpoints:\n";
+  message += "/ - Main interface\n";
+  message += "/test - Simple test page\n";
+  server.send(404, "text/plain", message);
+}
+
+// Simple test handler for debugging connectivity
+void handleTest() {
+  String response = "ESP32PhotoFrame Test Page\n\n";
+  response += "✅ Web server is working!\n";
+  response += "Time: " + String(millis()) + " ms\n";
+  response += "Free heap: " + String(ESP.getFreeHeap()) + " bytes\n";
+  
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    response += "Mode: Access Point\n";
+    response += "AP IP: " + WiFi.softAPIP().toString() + "\n";
+    response += "Connected clients: " + String(WiFi.softAPgetStationNum()) + "\n";
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    response += "WiFi: Connected\n";
+    response += "STA IP: " + WiFi.localIP().toString() + "\n";
+  }
+  
+  server.send(200, "text/plain", response);
+}
+
+// WiFi management handlers
+void handleScanWifi() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  Serial.println("📡 Scanning for WiFi networks...");
+  int networks = WiFi.scanNetworks();
+  
+  String json = "[";
+  for (int i = 0; i < networks; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    json += "\"encryption\":" + String((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? 0 : 1);
+    json += "}";
+  }
+  json += "]";
+  
+  Serial.printf("✓ Found %d networks\n", networks);
+  server.send(200, "application/json", json);
+}
+
+void handleConnectWifi() {
+  if (!checkAuthentication()) {
+    server.send(401, "text/html; charset=utf-8", getLoginPage());
+    return;
+  }
+  
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    server.send(400, "text/plain", "Missing SSID or password");
+    return;
+  }
+  
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  
+  Serial.printf("🔗 Attempting to connect to WiFi: %s\n", ssid.c_str());
+  
+  // If we're in AP mode, we need to switch to AP+STA mode
+  if (WiFi.getMode() == WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(100); // Brief delay for mode switch
+  }
+  
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  // Wait up to 20 seconds for connection
+  int timeout = 20;
+  while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+    delay(1000);
+    timeout--;
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected successfully!");
+    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+    
+    // Save credentials to preferences for persistence
+    preferences.begin("wifi", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    preferences.end();
+    Serial.println("✓ WiFi credentials saved for next boot");
+    
+    server.send(200, "text/plain", "✅ Connected to " + ssid + "! IP: " + WiFi.localIP().toString() + 
+                "\n\nCredentials saved. The device will now switch to WiFi mode.\n" +
+                "Please reconnect to the new IP address: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n❌ WiFi connection failed");
+    server.send(400, "text/plain", "❌ Failed to connect to " + ssid + 
+                "\n\nPlease check the network name and password and try again.");
+  }
 }
 
 // Initialize web server
 void setupWebServer() {
+  Serial.println("🌐 Setting up web server...");
+  
+  // Only set up the custom web server when connected to WiFi (not in AP mode)
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ WiFi not connected - skipping custom web server setup");
+    return;
+  }
+  
+  // Stop any existing server instance
+  server.stop();
+  server.close();
+  
+  delay(100); // Brief delay before restart
+  
+  Serial.println("🌐 Configuring web server routes...");
+  
   server.on("/", handleRoot);
+  server.on("/test", HTTP_GET, handleTest);
   server.on("/login", HTTP_POST, handleLogin);
   server.on("/logout", HTTP_POST, handleLogout);
+  
+  // Admin and control handlers
   server.on("/setWakeup", HTTP_POST, handleSetWakeup);
   server.on("/setDebugMode", HTTP_POST, handleSetDebugMode);
   server.on("/addUrl", HTTP_POST, handleAddUrl);
@@ -2242,13 +2568,18 @@ void setupWebServer() {
   server.on("/displayImage", HTTP_POST, handleDisplayImage);
   server.on("/nextImage", HTTP_POST, handleNextImage);
   server.on("/changePassword", HTTP_POST, handleChangePassword);
+  server.on("/scanWifi", HTTP_GET, handleScanWifi);
+  server.on("/connectWifi", HTTP_POST, handleConnectWifi);
   server.on("/firmware", HTTP_POST, []() {
     server.send(200, "text/plain", "");
   }, handleFirmwareUpdate);
+  
+  // Handle 404
   server.onNotFound(handleNotFound);
   
-  server.begin();
-  Serial.println("✓ Web server started on port 80");
+  server.begin(80); // Explicitly specify port 80
+  
+  Serial.println("✓ Custom web server started on port 80");
   Serial.printf("✓ Access control panel at: http://%s\n", WiFi.localIP().toString().c_str());
 }
 
@@ -2268,10 +2599,10 @@ void setup() {
     Serial.println("FATAL: I2C initialization failed!");
   }
   
-  // Wait for Pi Pico to fully initialize I2C slave
-  Serial.println("Waiting for Pi Pico I2C slave to initialize...");
-  delay(2000); // 2 second startup delay for reliable I2C communication
-  Serial.println("✓ I2C slave initialization period complete");
+  // Wait for Pi Pico to fully initialize I2C slave and battery sampling
+  Serial.println("Waiting for Pi Pico I2C slave and battery sampling to initialize...");
+  delay(3000); // 3 second startup delay for reliable I2C communication and battery stabilization
+  Serial.println("✓ I2C slave and battery sampling initialization period complete");
   
   // Check charging status to determine WiFi behavior
   uint8_t charging_status = getChargingStatus();
@@ -2294,21 +2625,14 @@ void setup() {
   if (should_enable_wifi) {
     Serial.println("Initializing WiFi Manager (CHARGING MODE - full features enabled)...");
     
-    // Start with low power mode during connection setup for efficiency
-    setWiFiLowPowerMode();
-    
-    wm.setBreakAfterConfig(true);
-    wm.setConfigPortalTimeout(1800); // 30 minutes timeout for config portal when charging
-    wm.setConnectTimeout(30); // 30s connection timeout
+    // Configure WiFiManager before any connection attempts
+    wm.setAPStaticIPConfig(IPAddress(192,168,0,1), IPAddress(192,168,0,1), IPAddress(255,255,255,0));
+    wm.setConnectTimeout(10); // Short timeout for initial connection attempt
     wm.setConfigPortalBlocking(false);
-    wm.setSaveConfigCallback([]() {
-      Serial.println("WiFi config saved - immediate restart");
-    });
+    wm.setConfigPortalTimeout(0); // Disable portal timeout for the initial autoConnect
     
-    if (!wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
-      Serial.println("WiFi connection failed after 30s - but staying in charging mode");
-      Serial.println("Configuration portal may be available for setup");
-    } else {
+    Serial.println("Attempting to connect to saved WiFi...");
+    if (wm.autoConnect("ESP32PhotoFrame")) {
       Serial.println("✓ WiFi connected successfully");
       Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
       
@@ -2317,35 +2641,48 @@ void setup() {
       
       // Keep WiFi in low power mode even when charging for energy efficiency
       Serial.println("🔌 CHARGING MODE: Maintaining WiFi low power mode for energy efficiency");
-      setWiFiLowPowerMode();
       WiFi.setAutoReconnect(true);
       WiFi.persistent(true);
       Serial.println("✓ WiFi low power optimizations enabled for charging mode");
       
       // Initialize web server for configuration
       setupWebServer();
+    } else {
+      Serial.println("WiFi connection failed - WiFiManager portal is already active");
+      Serial.println("🌐 WiFiManager configuration portal is running");
+      Serial.println("📱 Connect to 'ESP32PhotoFrame' hotspot to configure WiFi");
+      Serial.println("🌐 Portal is available at: http://192.168.0.1");
+      
+      // The portal is already running from autoConnect(), so we just need to wait
+      // Set up a callback to know when WiFi gets connected
+      wm.setSaveConfigCallback([](){
+        Serial.println("✓ WiFi configuration saved via portal");
+      });
+      
+      // Don't go to sleep - let the portal run in the main loop via wm.process()
+      Serial.println("📡 Portal is active - waiting for WiFi configuration...");
+      Serial.println("� Device will stay awake while portal is active");
     }
   } else {
-    // Battery mode - attempt quick WiFi connection only
-    Serial.println("Attempting quick WiFi connection (BATTERY MODE - 10s timeout)...");
+    // Battery mode - attempt WiFi connection, then sleep if failed
+    Serial.println("Attempting WiFi connection (BATTERY MODE - 30s timeout)...");
     
-    // Start with low power mode for efficient connection in battery mode
-    setWiFiLowPowerMode();
-    
-    wm.setConnectTimeout(10); // Very short timeout for battery mode
-    wm.setConfigPortalTimeout(0); // Disable config portal
+    wm.setConnectTimeout(30); // 30s timeout for battery mode
+    wm.setConfigPortalTimeout(0); // Disable config portal completely in battery mode
     wm.setConfigPortalBlocking(false);
     
-    if (wm.autoConnect("ESP32PhotoFrame", "photoframe123")) {
+    if (wm.autoConnect("ESP32PhotoFrame")) {
       Serial.println("✓ Quick WiFi connection successful");
       Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
       
       // Keep low power mode active for battery conservation
       Serial.println("🔋 BATTERY MODE: Maintaining WiFi low power mode for energy efficiency");
-      // Low power mode already set above, just maintain it
+      // Initialize web server for configuration even in battery mode when connected
+      setupWebServer();
     } else {
-      Serial.println("❌ Quick WiFi connection failed - entering deep sleep mode");
-      Serial.println("💤 Putting renderer to sleep and entering ESP32 deep sleep");
+      Serial.println("❌ WiFi connection failed - entering deep sleep to save battery");
+      Serial.println("� BATTERY MODE: No WiFi connection - conserving battery power");
+      Serial.println("� Device will sleep until next wakeup interval");
       
       // Put renderer to sleep before ESP32 sleeps
       if (putRendererToSleep()) {
@@ -2363,81 +2700,15 @@ void setup() {
       
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-      esp_deep_sleep_start(); // Sleep indefinitely until reset
+      
+      // Configure wake-up source (using default 30 minute interval)
+      uint64_t sleepTimeUS = 30ULL * 60ULL * 1000000ULL; // 30 minutes in microseconds
+      esp_sleep_enable_timer_wakeup(sleepTimeUS);
+      
+      esp_deep_sleep_start();
     }
   }
 
-  Serial.println("===================");
-  Serial.printf("Power efficiency mode: MAXIMUM\n");
-  Serial.printf("Free heap: available\n");
-  Serial.printf("Image data size: %d bytes\n", sizeof(Image7color));
-  
-  // Initialize I2C communication with fastest settings
-  if (!initI2C()) {
-    Serial.println("FATAL: I2C initialization failed!");
-  }
-  
-  // Wait for Pi Pico to fully initialize I2C slave
-  Serial.println("Waiting for Pi Pico I2C slave to initialize...");
-  delay(2000); // 2 second startup delay for reliable I2C communication
-  Serial.println("✓ I2C slave initialization period complete");
-  
-  // Perform I2C bus scan to check for devices
-  Serial.println("=== I2C BUS SCAN ===");
-  Serial.println("Scanning for I2C devices...");
-  
-  int deviceCount = 0;
-  for (uint8_t address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    uint8_t error = Wire.endTransmission();
-    
-    if (error == 0) {
-      Serial.printf("✓ I2C device found at address 0x%02X\n", address);
-      deviceCount++;
-      
-      if (address == PI_PICO_I2C_ADDRESS) {
-        Serial.printf("✓ CONFIRMED: Pi Pico found at expected address 0x%02X\n", address);
-      }
-    } else if (error == 4) {
-      Serial.printf("✗ Unknown error at address 0x%02X\n", address);
-    }
-  }
-  
-  if (deviceCount == 0) {
-    Serial.println("✗ NO I2C DEVICES FOUND!");
-    Serial.println("This indicates:");
-    Serial.println("  1. Pi Pico is not powered or not running");
-    Serial.println("  2. I2C wiring issues (SDA/SCL swapped or disconnected)");
-    Serial.println("  3. Pi Pico I2C slave code not running");
-    Serial.println("  4. Wrong I2C address in Pi Pico code");
-  } else {
-    Serial.printf("✓ Found %d I2C device(s)\n", deviceCount);
-    
-    if (deviceCount > 0) {
-      // Test communication with our expected device
-      Serial.printf("Testing communication with Pi Pico at 0x%02X...\n", PI_PICO_I2C_ADDRESS);
-      
-      Wire.beginTransmission(PI_PICO_I2C_ADDRESS);
-      uint8_t testError = Wire.endTransmission();
-      
-      if (testError == 0) {
-        Serial.println("✓ Pi Pico responds to address!");
-      } else {
-        Serial.printf("✗ Pi Pico does not respond (error: %d)\n", testError);
-        if (testError == 2) {
-          Serial.println("  → NACK on address - Pi Pico not at this address");
-        } else if (testError == 5) {
-          Serial.println("  → Timeout - Pi Pico may be busy or address wrong");
-        }
-      }
-    }
-  }
-
-  Serial.println("=== ESP32 I2C Master Ready===");
-  
-  // Initialize battery data now that I2C is ready
-  initBatteryData();
-  
   // Auto-fetch first image on boot if URLs are configured
   autoFetchOnBoot();
 }
@@ -2481,16 +2752,15 @@ void autoFetchOnBoot() {
   if (success) {
     Serial.println("✅ Auto-fetch completed successfully!");
     Serial.println("Image should now be displaying on the e-paper screen");
+    Serial.println("Battery info was sent to display before rendering to ensure current readings");
     
-    // Get and display battery info after successful display
-    unsigned long battery_start = millis();
-    float voltage = getBatteryVoltage();
-    if (voltage > 0) {
-      sendBatteryInfoToDisplay(voltage, display_cycle_count);
-      Serial.printf("🔋 Battery status sent: %.2fV, %u cycles\n", voltage, display_cycle_count);
+    // In battery mode, set flag to prevent main loop from doing another transfer
+    uint8_t charging_status = getChargingStatus(); 
+    if (charging_status != 1 && charging_status != 2) {
+      Serial.println("🔋 BATTERY MODE: Auto-fetch completed - renderer will power off after display");
+      Serial.println("💤 ESP32 will also enter deep sleep to save battery");
+      auto_fetch_completed_in_battery_mode = true; // Set flag to trigger shutdown in loop
     }
-    unsigned long battery_time = millis() - battery_start;
-    Serial.printf("⏱️ Battery info update: %lu ms\n", battery_time);
   } else {
     Serial.println("❌ Auto-fetch failed - check URL and network connection");
   }
@@ -2570,17 +2840,26 @@ bool downloadAndStreamImage(const char* url) {
       Serial.printf("✓ Streaming completed: %d bytes in %d chunks\n", bytesRead, chunk_id);
       http.end();
       
-      // Send render command immediately
+      // Get battery info BEFORE sending render command (renderer will sleep after rendering)
+      Serial.println("Getting battery status before rendering...");
+      float voltage = getBatteryVoltage();
+      if (voltage > 0.0f) {
+        current_battery_voltage = voltage; // Update local cache
+        Serial.printf("✓ Pre-render battery voltage: %.2fV\n", voltage);
+      } else {
+        Serial.printf("⚠ Could not get battery voltage, using cached: %.2fV\n", current_battery_voltage);
+      }
+      
+      // Send battery info to display BEFORE rendering
+      sendBatteryInfoToDisplay(current_battery_voltage, display_cycle_count);
+      Serial.printf("🔋 Battery info sent before rendering: %.2fV, %u cycles\n", 
+                   current_battery_voltage, display_cycle_count);
+      
+      // Send render command
       if (!sendRenderCommand()) {
         return false;
       }
-      
-      // Send updated battery info to display after successful render
-      float voltage = getBatteryVoltage();
-      if (voltage > 0.0f) {
-        sendBatteryInfoToDisplay(voltage, display_cycle_count);
-        current_battery_voltage = voltage; // Update local cache
-      }
+      Serial.println("✓ Render command sent - Pi Pico will now render and may sleep in battery mode");
       
       Serial.println("✓ Stream transfer and render command complete");
       return true;
@@ -2599,10 +2878,6 @@ bool downloadAndStreamImage(const char* url) {
 bool downloadAndConvertBmpImage(const char* url) {
   Serial.printf("🚀 ESP32 PERFORMANCE: Starting BMP download and streaming conversion from: %s\n", url);
   
-  // ESP32 WIFI POWER OPTIMIZATION: Maintain low power mode for energy-efficient downloads
-  Serial.println("� Maintaining WiFi LOW POWER mode for energy-efficient BMP download");
-  setWiFiLowPowerMode();
-  
   // ESP32 HIGH-PRECISION TIMING for breakthrough performance measurement
   #ifdef ESP32_PERFORMANCE_OPTIMIZED
   int64_t total_start_time = esp_timer_get_time(); // Microsecond precision
@@ -2611,7 +2886,23 @@ bool downloadAndConvertBmpImage(const char* url) {
   #endif
   
   HTTPClient http;
-  http.begin(url);
+  WiFiClient* client = nullptr;
+  
+  // Check if URL is HTTPS and setup secure client
+  bool isHttps = (strncmp(url, "https://", 8) == 0);
+  if (isHttps) {
+    Serial.println("🔒 HTTPS URL detected, setting up secure client...");
+    WiFiClientSecure* secureClient = new WiFiClientSecure();
+    secureClient->setInsecure(); // Skip certificate verification for now
+    client = secureClient;
+    http.begin(*secureClient, url);
+  } else {
+    Serial.println("🌐 HTTP URL detected, using standard client...");
+    WiFiClient* standardClient = new WiFiClient();
+    client = standardClient;
+    http.begin(*standardClient, url);
+  }
+  
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   
   // Optimized headers for faster downloads
@@ -2633,7 +2924,7 @@ bool downloadAndConvertBmpImage(const char* url) {
   Serial.printf("⏱️ HTTP connection and request: %lu ms\n", http_connect_time);
   
   if (httpCode > 0) {
-    Serial.printf("HTTP response code: %d\n", httpCode);
+    Serial.printf("✓ HTTP response code: %d\n", httpCode);
     
     // Debug response headers for troubleshooting
     String contentType = http.header("Content-Type");
@@ -2670,7 +2961,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       
       if (!header_buffer) {
         Serial.printf("✗ Failed to allocate header buffer (%d bytes)\n", header_size);
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2703,7 +2994,7 @@ bool downloadAndConvertBmpImage(const char* url) {
                      header_read, header_size, millis() - start_time);
         Serial.printf("Stream available: %d bytes\n", stream->available());
         free(header_buffer);
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2716,7 +3007,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       if (!parseBmpHeader(header_buffer, header_size, &fileHeader, &infoHeader)) {
         Serial.println("✗ Invalid BMP file format");
         free(header_buffer);
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2733,7 +3024,7 @@ bool downloadAndConvertBmpImage(const char* url) {
       // Validate format - support both 8-bit indexed and 24-bit RGB
       if (infoHeader.biBitCount != 8 && infoHeader.biBitCount != 24) {
         Serial.printf("✗ Unsupported bit depth: %d (need 8-bit indexed or 24-bit RGB)\n", infoHeader.biBitCount);
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2741,7 +3032,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         Serial.printf("✗ BMP dimensions (%dx%d) don't match display (800x480)\n", 
                      infoHeader.biWidth, infoHeader.biHeight);
         Serial.println("   → Use the ImageConverter tool to create properly sized BMPs");
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2758,7 +3049,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         
         if (!palette_buffer) {
           Serial.printf("✗ Failed to allocate palette buffer (%d bytes)\n", palette_size);
-          http.end();
+          cleanupHttpClient(http, client);
           return false;
         }
         
@@ -2791,7 +3082,7 @@ bool downloadAndConvertBmpImage(const char* url) {
           Serial.printf("✗ Failed to read BMP palette (got %d of %d bytes after %lu ms)\n", 
                        palette_read, palette_size, millis() - start_time);
           free(palette_buffer);
-          http.end();
+          cleanupHttpClient(http, client);
           return false;
         }
         
@@ -2802,7 +3093,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         if (!color_lookup) {
           Serial.println("✗ Failed to allocate color lookup table");
           free(palette_buffer);
-          http.end();
+          cleanupHttpClient(http, client);
           return false;
         }
         
@@ -2880,7 +3171,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         if (palette_buffer) {
           free(palette_buffer);
         }
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2900,7 +3191,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         if (palette_buffer) {
           free(palette_buffer);
         }
-        http.end();
+        cleanupHttpClient(http, client);
         return false;
       }
       
@@ -2974,7 +3265,7 @@ bool downloadAndConvertBmpImage(const char* url) {
             if (palette_buffer) {
               free(palette_buffer);
             }
-            http.end();
+            cleanupHttpClient(http, client);
             return false;
           }
           
@@ -3032,7 +3323,7 @@ bool downloadAndConvertBmpImage(const char* url) {
                 if (palette_buffer) {
                   free(palette_buffer);
                 }
-                http.end();
+                cleanupHttpClient(http, client);
                 return false;
               }
               
@@ -3091,7 +3382,7 @@ bool downloadAndConvertBmpImage(const char* url) {
             if (color_lookup) {
               free(color_lookup);
             }
-            http.end();
+            cleanupHttpClient(http, client);
             return false;
           }
           bytes_streamed += work_buffer_pos;
@@ -3106,9 +3397,26 @@ bool downloadAndConvertBmpImage(const char* url) {
         if (color_lookup) {
           free(color_lookup);
         }
-        http.end();
         
         Serial.printf("✓ BMP streaming conversion completed: %d bytes processed\n", bytes_streamed);
+        
+        // Get battery info BEFORE sending render command (renderer will sleep after rendering)
+        Serial.println("Getting battery status before rendering...");
+        unsigned long battery_pre_start = millis();
+        float voltage = getBatteryVoltage();
+        if (voltage > 0.0f) {
+          current_battery_voltage = voltage; // Update local cache
+          Serial.printf("✓ Pre-render battery voltage: %.2fV\n", voltage);
+        } else {
+          Serial.printf("⚠ Could not get battery voltage, using cached: %.2fV\n", current_battery_voltage);
+        }
+        unsigned long battery_pre_time = millis() - battery_pre_start;
+        Serial.printf("⏱️ Pre-render battery check: %lu ms\n", battery_pre_time);
+        
+        // Send battery info to display BEFORE rendering
+        sendBatteryInfoToDisplay(current_battery_voltage, display_cycle_count);
+        Serial.printf("🔋 Battery info sent before rendering: %.2fV, %u cycles\n", 
+                     current_battery_voltage, display_cycle_count);
         
         // Send BMP reorder and render command (renderer will reorder from BMP to display format)
         unsigned long render_start = millis();
@@ -3117,16 +3425,7 @@ bool downloadAndConvertBmpImage(const char* url) {
         }
         unsigned long render_command_time = millis() - render_start;
         Serial.printf("⏱️ Render command transmission: %lu ms\n", render_command_time);
-        
-        // Send updated battery info to display after successful BMP render
-        unsigned long battery_update_start = millis();
-        float voltage = getBatteryVoltage();
-        if (voltage > 0.0f) {
-          sendBatteryInfoToDisplay(voltage, display_cycle_count);
-          current_battery_voltage = voltage; // Update local cache
-        }
-        unsigned long battery_update_time = millis() - battery_update_start;
-        Serial.printf("⏱️ Battery info update: %lu ms\n", battery_update_time);
+        Serial.println("✓ Render command sent - Pi Pico will now render and may sleep in battery mode");
         
         // ESP32 BREAKTHROUGH PERFORMANCE: Final timing calculation with microsecond precision
         #ifdef ESP32_PERFORMANCE_OPTIMIZED
@@ -3160,9 +3459,13 @@ bool downloadAndConvertBmpImage(const char* url) {
         
         Serial.println("✅ ESP32 BMP streaming conversion and render command complete");
         
-        // ESP32 WIFI POWER OPTIMIZATION: Return to low power mode after download
-        Serial.println("🔋 Restoring WiFi LOW POWER mode after successful download");
-        setWiFiLowPowerMode();
+        // Clean up HTTP client and WiFiClient
+        http.end();
+        if (client) {
+          delete client;
+          client = nullptr;
+        }
+
         
         return true;
     } else {
@@ -3195,21 +3498,61 @@ bool downloadAndConvertBmpImage(const char* url) {
     }
   } else {
     Serial.printf("✗ HTTP connection failed: %s\n", http.errorToString(httpCode).c_str());
+    
+    // Enhanced error reporting for HTTPS/SSL issues
+    if (isHttps) {
+      Serial.println("🔒 HTTPS connection troubleshooting:");
+      if (httpCode == -1) {
+        Serial.println("   → SSL handshake failed or timeout");
+        Serial.println("   → This is common with GitHub raw URLs");
+        Serial.println("   → Try using HTTP instead: http://example.com/image.bmp");
+      } else if (httpCode == -11) {
+        Serial.println("   → SSL connection timeout");
+        Serial.println("   → Server may not support SSL or certificate expired");
+      } else if (httpCode == -5) {
+        Serial.println("   → Connection refused");
+        Serial.println("   → Server may be blocking ESP32 user agent");
+      }
+    }
+    
     Serial.println("   → Check WiFi connection and URL validity.");
+    Serial.printf("   → HTTP error code: %d\n", httpCode);
   }
 
   http.end();
   
-  // ESP32 WIFI POWER OPTIMIZATION: Return to low power mode after failed download
-  Serial.println("🔋 Restoring WiFi LOW POWER mode after download attempt");
-  setWiFiLowPowerMode();
+  // Clean up WiFiClient
+  if (client) {
+    delete client;
+    client = nullptr;
+  }
+  
   
   return false;
 }
 
 void loop() {
-  // Handle web server requests
-  server.handleClient();
+  // Handle web server requests (only when connected to WiFi)
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+  
+  // Process WiFiManager - this handles the portal and connection attempts
+  wm.process();
+  
+  // Check if WiFi just got connected and we need to start the web server
+  static bool wasConnected = false;
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  
+  if (!wasConnected && isConnected) {
+    Serial.println("✅ WiFi connected successfully!");
+    Serial.printf("✅ Connected to: %s\n", WiFi.SSID().c_str());
+    Serial.printf("🌐 IP address: %s\n", WiFi.localIP().toString().c_str());
+    
+    // Initialize web server after successful WiFi configuration
+    setupWebServer();
+  }
+  wasConnected = isConnected;
   
   static unsigned long lastImageSend = 0;
   static bool i2cWorking = false;
@@ -3228,7 +3571,13 @@ void loop() {
       isChargingMode = true;
       Serial.println("🔌 CHARGING MODE: Power connected - running web server only (no automatic image updates)");
       Serial.println("📱 Use the web interface to manually control image display");
-      Serial.printf("🌐 Access control panel at: http://%s\n", WiFi.localIP().toString().c_str());
+      
+      // Show IP if connected to WiFi
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("🌐 Access control panel at: http://%s\n", WiFi.localIP().toString().c_str());
+      } else {
+        Serial.println("🌐 WiFi not connected - control panel not available");
+      }
     } else {
       // Battery mode - normal power-efficient operation
       isChargingMode = false;
@@ -3272,6 +3621,19 @@ void loop() {
   }
   
   // BATTERY MODE ONLY - Continue with original power-efficient behavior
+  
+  // Check if auto-fetch completed successfully in battery mode - if so, shutdown immediately
+  if (auto_fetch_completed_in_battery_mode) {
+    Serial.println("🔋 BATTERY MODE: Auto-fetch completed successfully during setup");
+    Serial.println("💤 Waiting for renderer to finish and power off, then shutting down ESP32");
+    
+    // Give renderer time to complete rendering and power off (it has 3 second delay)
+    delay(5000); // 5 seconds should be enough for renderer to complete and sleep
+    
+    // Now shutdown ESP32
+    Serial.println("🔋 BATTERY MODE: Shutting down ESP32 after auto-fetch success");
+    shutdownESP32(); // This function never returns
+  }
   // Test I2C connection every 30 seconds if it's not working
   if (!i2cWorking && (currentTime - lastI2CTest > 30000)) {
     Serial.println("=== RETESTING I2C CONNECTION ===");
